@@ -82,20 +82,12 @@ export class AudioService {
     });
 
     this.audio.addEventListener('error', async (e) => {
-      console.warn('Audio playback error, attempting fallback source:', e);
+      console.warn('Audio playback error for current recitation:', e);
       if (this.state.currentRecitation && this.audio) {
         // 1. Check for offline cached copy
         const localSource = await offlineAudioService.getPlayableAudioUrl(this.state.currentRecitation.id);
         if (localSource && this.audio.src !== localSource) {
           this.audio.src = localSource;
-          this.audio.play().catch(() => {});
-          return;
-        }
-
-        // 2. Safe fallback Quran stream for this surah
-        const fallbackUrl = SupabaseService.getFallbackQuranAudioUrl(this.state.currentRecitation.surahNumber);
-        if (this.audio.src !== fallbackUrl) {
-          this.audio.src = fallbackUrl;
           this.audio.play().catch(() => {});
           return;
         }
@@ -149,10 +141,17 @@ export class AudioService {
     this.state.duration = recitation.duration;
     this.state.currentTime = 0;
 
-    // Resolve offline playable audio URL or fallback to streaming URL
+    // Resolve offline playable audio URL or streaming URL
     let playableSource = await offlineAudioService.getPlayableAudioUrl(recitation.id, recitation.audioUrl);
     if (!playableSource || !SupabaseService.isValidAudioSource(playableSource)) {
       playableSource = SupabaseService.resolveAudioUrl(recitation);
+    }
+
+    if (!playableSource || !SupabaseService.isValidAudioSource(playableSource)) {
+      console.warn('No valid audio source found for recitation:', recitation.id);
+      this.state.isPlaying = false;
+      this.notifyListeners();
+      return;
     }
 
     this.audio.src = playableSource;

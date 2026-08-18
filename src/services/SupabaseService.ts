@@ -7,8 +7,7 @@ import { Competition, Announcement, RewardDefinition, ReciterHonor } from '../ty
 import {
   normalizeImageUrl,
   normalizeAudioUrl,
-  isValidAudioUrl,
-  getFallbackQuranAudioUrl
+  isValidAudioUrl
 } from '../utils/mediaUtils';
 
 const liveAnonKey =
@@ -55,14 +54,7 @@ export class SupabaseService {
   }
 
   /**
-   * Reliable high-availability CDN Quran recitation stream fallback matching Surah number
-   */
-  static getFallbackQuranAudioUrl(surahNumber?: number | string | null): string {
-    return getFallbackQuranAudioUrl(surahNumber);
-  }
-
-  /**
-   * Safe audio URL resolver following exact priority
+   * Safe audio URL resolver following exact priority without any fallback dummy audio
    */
   static resolveAudioUrl(record?: {
     audio_storage_path?: string | null;
@@ -323,7 +315,8 @@ export class SupabaseService {
         p_riwayah: payload.riwayah || 'حفص عن عاصم',
         p_description: payload.description || '',
         p_audio_storage_path: payload.audio_storage_path || '',
-        p_external_audio_url: payload.external_audio_url || null
+        p_external_audio_url: payload.external_audio_url || null,
+        p_installation_id: payload.installation_id || null
       };
 
       const rpcRes = await fetch(`${SUPABASE_CONFIG.restBaseUrl}/rpc/submit_recitation_public`, {

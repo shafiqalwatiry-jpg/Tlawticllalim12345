@@ -1,4 +1,4 @@
-import React, { useState } from 'react';
+import React, { useState, useRef, useEffect } from 'react';
 import {
   Mic,
   BookOpen,
@@ -14,13 +14,16 @@ import {
   ArrowRight,
   Info,
   X,
-  Music
+  Music,
+  Play,
+  Pause
 } from 'lucide-react';
 import { SURAH_LIST, RIWAYAT_OPTIONS } from '../data/quranSurahs';
 import { CountrySelectField } from './CountrySelectField';
 import { RecitationSubmission } from '../types';
 import { SupabaseService } from '../services/SupabaseService';
 import { userService } from '../services/UserService';
+import { isValidAudioUrl } from '../utils/mediaUtils';
 
 interface SubmitRecitationViewProps {
   onSubmit: (data: Omit<RecitationSubmission, 'id' | 'submittedAt' | 'status'>) => Promise<RecitationSubmission>;
@@ -60,6 +63,52 @@ export const SubmitRecitationView: React.FC<SubmitRecitationViewProps> = ({
 
   const selectedSurah = SURAH_LIST.find((s) => s.number === surahNumber) || SURAH_LIST[0];
 
+  const [previewAudioUrl, setPreviewAudioUrl] = useState<string | null>(null);
+  const [isPlayingPreview, setIsPlayingPreview] = useState(false);
+  const previewAudioRef = useRef<HTMLAudioElement | null>(null);
+
+  // Clean up preview audio on unmount or file change
+  useEffect(() => {
+    return () => {
+      if (previewAudioRef.current) {
+        previewAudioRef.current.pause();
+        previewAudioRef.current.src = '';
+      }
+      if (previewAudioUrl) {
+        URL.revokeObjectURL(previewAudioUrl);
+      }
+    };
+  }, [previewAudioUrl]);
+
+  const togglePlayPreview = () => {
+    if (!previewAudioUrl && !externalAudioUrl) return;
+    const targetSrc = previewAudioUrl || externalAudioUrl;
+
+    if (isPlayingPreview && previewAudioRef.current) {
+      previewAudioRef.current.pause();
+      setIsPlayingPreview(false);
+      return;
+    }
+
+    if (!previewAudioRef.current) {
+      previewAudioRef.current = new Audio(targetSrc);
+      previewAudioRef.current.onended = () => setIsPlayingPreview(false);
+      previewAudioRef.current.onerror = () => {
+        setIsPlayingPreview(false);
+        setErrorMessage('تعذر تشغيل الملف الصوتي المحدد للمعاينة.');
+      };
+    } else {
+      previewAudioRef.current.src = targetSrc;
+    }
+
+    previewAudioRef.current.play().then(() => {
+      setIsPlayingPreview(true);
+    }).catch(() => {
+      setIsPlayingPreview(false);
+      setErrorMessage('تعذر بدء تشغيل المعاينة الصوتية.');
+    });
+  };
+
   const handleAudioSelect = (e: React.ChangeEvent<HTMLInputElement>) => {
     setErrorMessage('');
     const file = e.target.files?.[0];
@@ -82,6 +131,18 @@ export const SubmitRecitationView: React.FC<SubmitRecitationViewProps> = ({
       return;
     }
 
+    // Stop existing preview
+    if (previewAudioRef.current) {
+      previewAudioRef.current.pause();
+      setIsPlayingPreview(false);
+    }
+    if (previewAudioUrl) {
+      URL.revokeObjectURL(previewAudioUrl);
+    }
+
+    const objectUrl = URL.createObjectURL(file);
+    setPreviewAudioUrl(objectUrl);
+
     // Valid file selected
     setAudioFile(file);
     setAudioFileName(file.name);
@@ -90,16 +151,11 @@ export const SubmitRecitationView: React.FC<SubmitRecitationViewProps> = ({
 
     // Detect actual audio duration via HTMLAudioElement
     try {
-      const audioUrl = URL.createObjectURL(file);
-      const tempAudio = new Audio(audioUrl);
+      const tempAudio = new Audio(objectUrl);
       tempAudio.onloadedmetadata = () => {
         if (tempAudio.duration && !isNaN(tempAudio.duration) && isFinite(tempAudio.duration)) {
           setAudioDuration(Math.round(tempAudio.duration));
         }
-        URL.revokeObjectURL(audioUrl);
-      };
-      tempAudio.onerror = () => {
-        URL.revokeObjectURL(audioUrl);
       };
     } catch {
       setAudioDuration(180);
@@ -107,6 +163,14 @@ export const SubmitRecitationView: React.FC<SubmitRecitationViewProps> = ({
   };
 
   const handleRemoveAudio = () => {
+    if (previewAudioRef.current) {
+      previewAudioRef.current.pause();
+      setIsPlayingPreview(false);
+    }
+    if (previewAudioUrl) {
+      URL.revokeObjectURL(previewAudioUrl);
+      setPreviewAudioUrl(null);
+    }
     setAudioFile(null);
     setAudioFileName('');
     setAudioFileSizeFormatted('');
@@ -127,6 +191,10 @@ export const SubmitRecitationView: React.FC<SubmitRecitationViewProps> = ({
     }
     if (!audioFile && !audioFileName && !externalAudioUrl.trim()) {
       setErrorMessage('يرجى اختيار ملف صوتي للتلاوة أو إضافة رابط خارجي للصوت.');
+      return;
+    }
+    if (externalAudioUrl.trim() && !isValidAudioUrl(externalAudioUrl.trim())) {
+      setErrorMessage('رابط الصوت الخارجي غير صالح أو لا يشير إلى ملف صوتي مباشر مدعوم.');
       return;
     }
     if (!agreeToTerms) {
@@ -521,6 +589,25 @@ export const SubmitRecitationView: React.FC<SubmitRecitationViewProps> = ({
                   </div>
 
                   <div className="flex items-center gap-2">
+                    {previewAudioUrl && (
+                      <button
+                        type="button"
+                        onClick={togglePlayPreview}
+                        className="px-3 py-1.5 rounded-lg bg-[#315F4A] hover:bg-[#254A39] text-white text-xs font-semibold flex items-center gap-1.5 transition-colors shadow-xs"
+                      >
+                        {isPlayingPreview ? (
+                          <>
+                            <Pause className="w-3.5 h-3.5" />
+                            <span>إيقاف</span>
+                          </>
+                        ) : (
+                          <>
+                            <Play className="w-3.5 h-3.5" />
+                            <span>معاينة الصوت</span>
+                          </>
+                        )}
+                      </button>
+                    )}
                     <label className="px-3 py-1.5 rounded-lg border border-[#E2E5DF] hover:bg-[#FAFBF9] text-[#102A20] text-xs font-semibold cursor-pointer transition-colors">
                       تغيير الملف
                       <input

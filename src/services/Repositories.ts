@@ -405,7 +405,8 @@ class HybridSubmissionRepository implements ISubmissionRepository {
         }
       }
 
-      const storagePath = data.audioStoragePath || `submission-audio/${submissionId}.mp3`;
+      const storagePath = data.audioStoragePath || '';
+      const installId = typeof window !== 'undefined' ? userService.getInstallationId() : undefined;
 
       const submitRes = await SupabaseService.submitRecitation({
         display_name: data.displayName,
@@ -422,6 +423,7 @@ class HybridSubmissionRepository implements ISubmissionRepository {
         description: data.description || '',
         audio_storage_path: storagePath,
         external_audio_url: data.externalAudioUrl || null,
+        installation_id: installId,
         status: 'PENDING'
       });
 

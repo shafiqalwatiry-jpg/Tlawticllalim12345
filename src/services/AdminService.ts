@@ -13,6 +13,7 @@ import {
   SubmissionStatus
 } from '../types';
 import { SUPABASE_CONFIG, SupabaseService } from './SupabaseService';
+import { userService } from './UserService';
 
 export interface AdminAuthDiagnostic {
   authHttpStatus?: number;
@@ -1783,6 +1784,7 @@ class AdminServiceImpl {
     targetType: 'all' | 'country' | 'user_type' | 'incomplete_profile' | 'specific_user';
     targetValue?: string;
   }): Promise<{ success: boolean; dispatchedCount: number }> {
+    let dispatchedCount = 0;
     // Strategy 1: Try database RPC admin_send_broadcast
     try {
       const rpcRes = await fetch(`${SUPABASE_CONFIG.restBaseUrl}/rpc/admin_send_broadcast`, {
@@ -1798,45 +1800,68 @@ class AdminServiceImpl {
       });
       if (rpcRes.ok) {
         const json = await rpcRes.json();
-        return { success: true, dispatchedCount: json.dispatched_count || 0 };
+        dispatchedCount = json.dispatched_count || 0;
       }
     } catch (e) {
       console.warn('RPC admin_send_broadcast bypassed, using REST fallback:', e);
     }
 
-    // Strategy 2: Direct REST broadcast via user_profiles query & batch insert
-    const users = await this.getUsers();
-    let targetUsers = users;
-    if (params.targetType === 'country' && params.targetValue) {
-      targetUsers = users.filter((u) => u.country === params.targetValue);
-    } else if (params.targetType === 'user_type' && params.targetValue) {
-      targetUsers = users.filter((u) => u.userType === params.targetValue);
-    } else if (params.targetType === 'incomplete_profile') {
-      targetUsers = users.filter((u) => !u.isProfileCompleted);
-    } else if (params.targetType === 'specific_user' && params.targetValue) {
-      targetUsers = users.filter((u) => u.id === params.targetValue || u.installationId === params.targetValue);
+    // Strategy 2: If RPC didn't dispatch, direct REST broadcast via user_profiles query & batch insert
+    if (dispatchedCount === 0) {
+      const users = await this.getUsers();
+      let targetUsers = users;
+      if (params.targetType === 'country' && params.targetValue) {
+        targetUsers = users.filter((u) => u.country === params.targetValue);
+      } else if (params.targetType === 'user_type' && params.targetValue) {
+        targetUsers = users.filter((u) => u.userType === params.targetValue);
+      } else if (params.targetType === 'incomplete_profile') {
+        targetUsers = users.filter((u) => !u.isProfileCompleted);
+      } else if (params.targetType === 'specific_user' && params.targetValue) {
+        targetUsers = users.filter((u) => u.id === params.targetValue || u.installationId === params.targetValue);
+      }
+
+      const payload = targetUsers.map((u) => ({
+        installation_id: u.installationId,
+        title: params.title,
+        body: params.body,
+        notification_type: params.notificationType || 'ADMIN_ANNOUNCEMENT',
+        is_read: false
+      }));
+
+      if (payload.length > 0) {
+        await fetch(`${SUPABASE_CONFIG.restBaseUrl}/user_notifications`, {
+          method: 'POST',
+          headers: {
+            ...this.getAuthHeaders(),
+            'Prefer': 'return=minimal'
+          },
+          body: JSON.stringify(payload)
+        });
+      }
+      dispatchedCount = payload.length;
     }
 
-    const payload = targetUsers.map((u) => ({
-      installation_id: u.installationId,
-      title: params.title,
-      body: params.body,
-      notification_type: params.notificationType || 'ADMIN_ANNOUNCEMENT',
-      is_read: false
-    }));
+    // Always dispatch to local active user session if applicable
+    const myProfile = userService.getProfile();
+    const myInstallId = userService.getInstallationId();
+    const matchesMe =
+      params.targetType === 'all' ||
+      (params.targetType === 'country' && myProfile?.country === params.targetValue) ||
+      (params.targetType === 'user_type' && myProfile?.userType === params.targetValue) ||
+      (params.targetType === 'incomplete_profile' && !myProfile?.isProfileCompleted) ||
+      (params.targetType === 'specific_user' && (params.targetValue === myInstallId || params.targetValue === myProfile?.id));
 
-    if (payload.length > 0) {
-      await fetch(`${SUPABASE_CONFIG.restBaseUrl}/user_notifications`, {
-        method: 'POST',
-        headers: {
-          ...this.getAuthHeaders(),
-          'Prefer': 'return=minimal'
-        },
-        body: JSON.stringify(payload)
+    if (matchesMe) {
+      userService.addNotification({
+        installationId: myInstallId,
+        title: params.title,
+        body: params.body,
+        notificationType: (params.notificationType as any) || 'ADMIN_ANNOUNCEMENT'
       });
+      dispatchedCount = Math.max(1, dispatchedCount);
     }
 
-    return { success: true, dispatchedCount: payload.length };
+    return { success: true, dispatchedCount };
   }
 
   // ============================================================================
