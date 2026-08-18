@@ -1,0 +1,10 @@
+{
+  "name": "تلاوتك قرام",
+  "description": "منصة تلاوتك للعالم للاستماع إلى تلاوات القرآن الكريم واكتشاف أصوات القراء ونشر التلاوات ومتابعة الاعتمادات والأوسمة",
+  "requestFramePermissions": [
+    "microphone"
+  ],
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}
