@@ -84,6 +84,7 @@ export const PlayerBar: React.FC<PlayerBarProps> = ({
 
             {/* Like */}
             <button
+              type="button"
               onClick={() => onLikeToggle(current.id)}
               className={`p-2 rounded-full transition-colors ${
                 current.isLiked ? 'text-rose-400' : 'text-white/70 hover:text-white'
@@ -95,6 +96,7 @@ export const PlayerBar: React.FC<PlayerBarProps> = ({
 
             {/* Previous */}
             <button
+              type="button"
               onClick={onPrevious}
               className="p-2 text-white/80 hover:text-white transition-colors"
               title="التلاوة السابقة"
@@ -104,6 +106,7 @@ export const PlayerBar: React.FC<PlayerBarProps> = ({
 
             {/* Play/Pause */}
             <button
+              type="button"
               onClick={onTogglePlay}
               className="w-10 h-10 rounded-2xl bg-[#55BFEA] hover:bg-[#1687C7] text-[#145273] hover:text-white flex items-center justify-center shadow-md transition-transform active:scale-95"
               title={playerState.isPlaying ? 'إيقاف مؤقت' : 'تشغيل'}
@@ -117,6 +120,7 @@ export const PlayerBar: React.FC<PlayerBarProps> = ({
 
             {/* Next */}
             <button
+              type="button"
               onClick={onNext}
               className="p-2 text-white/80 hover:text-white transition-colors"
               title="التلاوة التالية"
@@ -126,6 +130,7 @@ export const PlayerBar: React.FC<PlayerBarProps> = ({
 
             {/* Expand Modal */}
             <button
+              type="button"
               onClick={onExpand}
               className="p-2 text-white/80 hover:text-white transition-colors hidden sm:block"
               title="توسيع المشغل"
@@ -136,6 +141,7 @@ export const PlayerBar: React.FC<PlayerBarProps> = ({
             {/* Close / Dismiss Player */}
             {onClose && (
               <button
+                type="button"
                 onClick={onClose}
                 className="p-2 text-white/60 hover:text-white hover:bg-white/10 rounded-full transition-colors"
                 title="إغلاق المشغل"

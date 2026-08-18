@@ -96,6 +96,7 @@ export const RecitationCard: React.FC<RecitationCardProps> = ({
           <div className="flex items-center gap-3">
             {/* Play/Pause Button Circle */}
             <button
+              type="button"
               onClick={() => onPlay(recitation)}
               className={`w-12 h-12 rounded-2xl flex items-center justify-center transition-transform active:scale-95 shadow-sm shrink-0 ${
                 isCurrentPlaying
@@ -181,6 +182,7 @@ export const RecitationCard: React.FC<RecitationCardProps> = ({
         <div className="flex items-center gap-1">
           {/* Offline Download button */}
           <button
+            type="button"
             onClick={handleDownload}
             disabled={isDownloaded || isDownloading}
             className={`p-1.5 rounded-lg transition-colors ${
@@ -201,6 +203,7 @@ export const RecitationCard: React.FC<RecitationCardProps> = ({
 
           {/* Share */}
           <button
+            type="button"
             onClick={handleShare}
             className="p-1.5 text-[#6C8795] hover:text-[#1687C7] rounded-lg hover:bg-[#F6FBFF] transition-colors"
             title="مشاركة التلاوة"
@@ -210,6 +213,7 @@ export const RecitationCard: React.FC<RecitationCardProps> = ({
 
           {/* Like */}
           <button
+            type="button"
             onClick={(e) => {
               e.stopPropagation();
               onLikeToggle(recitation.id);
