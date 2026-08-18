@@ -1,16 +1,16 @@
 -- ============================================================================
--- Migration 026: Production Security Hardening and Data Integrity
+-- Migration 026: Production Security Hardening, Strict View Compatibility & Data Integrity
 -- Platform: TilawatakLilAlam (تلاوتك للعالم)
--- Description: 
---   1. Protects all administrative RPC functions with internal is_admin() authorization checks.
---   2. Revokes public/anonymous execution permissions on sensitive admin endpoints.
---   3. Guarantees cascade data integrity across reciters, recitations, submissions, likes, and notifications.
---   4. Standardizes metrics calculation directly from operational tables without static/hardcoded fallbacks.
---   5. Ensures robust RLS policies for guest profiles and in-app notifications.
+-- Description:
+--   1. Fully preserves legacy view column names, exact column order, and PostgreSQL 42P16 compatibility.
+--   2. Calculates reciter ranking score strictly: (total_likes * 3) + (total_listens * 1) + (total_recitations * 5).
+--   3. Eliminates Cartesian multiplication between likes and listen_events via isolated pre-aggregation subqueries.
+--   4. Protects all sensitive administrative RPCs with internal is_admin() checks and revokes anon access.
+--   5. Retains public guest access to visitor RPCs (submit_recitation_public, toggle_recitation_like, record_listen_event).
 -- ============================================================================
 
 -- ----------------------------------------------------------------------------
--- 1. Ensure Role Validation Functions Exist and are Idempotent
+-- 1. Ensure Role Validation Functions Exist (Idempotent)
 -- ----------------------------------------------------------------------------
 CREATE OR REPLACE FUNCTION public.is_admin()
 RETURNS BOOLEAN AS $$
@@ -38,39 +38,174 @@ END;
 $$ LANGUAGE plpgsql SECURITY DEFINER SET search_path = public, pg_temp;
 
 -- ----------------------------------------------------------------------------
--- 2. Secure Administrative Dashboard Metrics Function
+-- 2. Enhanced Views Preserving 100% Column Order, Names & Types Compatibility
+-- ----------------------------------------------------------------------------
+
+-- 2.1. Reciter Statistics View
+-- Exact legacy column order from Migration 008 + extensions from Migration 024:
+-- 1. reciter_id, 2. public_name, 3. gender, 4. country, 5. bio, 6. profile_image_path,
+-- 7. is_verified, 8. is_featured, 9. is_published, 10. created_at, 11. total_recitations,
+-- 12. total_likes, 13. total_listens, 14. ranking_score, 15. id, 16. display_name,
+-- 17. pseudonym, 18. use_pseudonym, 19. avatar_url.
+CREATE OR REPLACE VIEW public.reciter_statistics_view AS
+SELECT
+    rc.id AS reciter_id,
+    CASE
+        WHEN rc.use_pseudonym = TRUE AND rc.pseudonym IS NOT NULL AND TRIM(rc.pseudonym) <> '' THEN rc.pseudonym
+        ELSE rc.display_name
+    END AS public_name,
+    rc.gender,
+    rc.country,
+    rc.bio,
+    rc.profile_image_path,
+    rc.is_verified,
+    rc.is_featured,
+    rc.is_published,
+    rc.created_at,
+    COALESCE(rec_stats.total_recitations, 0)::BIGINT AS total_recitations,
+    COALESCE(lk_stats.total_likes, 0)::BIGINT AS total_likes,
+    COALESCE(ls_stats.total_listens, 0)::BIGINT AS total_listens,
+    (
+        (COALESCE(lk_stats.total_likes, 0)::BIGINT * 3) +
+        (COALESCE(ls_stats.total_listens, 0)::BIGINT * 1) +
+        (COALESCE(rec_stats.total_recitations, 0)::BIGINT * 5)
+    )::BIGINT AS ranking_score,
+    rc.id AS id,
+    rc.display_name,
+    rc.pseudonym,
+    rc.use_pseudonym,
+    rc.profile_image_path AS avatar_url
+FROM public.reciters rc
+LEFT JOIN (
+    SELECT reciter_id, COUNT(*) AS total_recitations
+    FROM public.recitations
+    WHERE status = 'APPROVED'
+    GROUP BY reciter_id
+) rec_stats ON rec_stats.reciter_id = rc.id
+LEFT JOIN (
+    SELECT r.reciter_id, COUNT(l.id) AS total_likes
+    FROM public.recitations r
+    JOIN public.likes l ON l.recitation_id = r.id
+    WHERE r.status = 'APPROVED'
+    GROUP BY r.reciter_id
+) lk_stats ON lk_stats.reciter_id = rc.id
+LEFT JOIN (
+    SELECT r.reciter_id, COUNT(le.id) AS total_listens
+    FROM public.recitations r
+    JOIN public.listen_events le ON le.recitation_id = r.id
+    WHERE r.status = 'APPROVED'
+    GROUP BY r.reciter_id
+) ls_stats ON ls_stats.reciter_id = rc.id
+WHERE rc.is_published = TRUE;
+
+-- 2.2. Recitation Statistics View
+-- Exact legacy column order from Migration 008 + extensions from Migration 024:
+-- 1. recitation_id, 2. reciter_id, 3. surah_name, 4. surah_number, 5. ayah_start,
+-- 6. ayah_end, 7. riwayah, 8. duration_seconds, 9. audio_storage_path, 10. external_audio_url,
+-- 11. cover_image_path, 12. status, 13. is_staff_pick, 14. published_at, 15. total_likes,
+-- 16. total_listens, 17. id, 18. reciter_name, 19. reciter_avatar, 20. reciter_country,
+-- 21. ayah_range, 22. description, 23. created_at.
+CREATE OR REPLACE VIEW public.recitation_statistics_view AS
+SELECT
+    r.id AS recitation_id,
+    r.reciter_id,
+    r.surah_name,
+    r.surah_number,
+    r.ayah_start,
+    r.ayah_end,
+    r.riwayah,
+    r.duration_seconds,
+    r.audio_storage_path,
+    r.external_audio_url,
+    r.cover_image_path,
+    r.status,
+    r.is_staff_pick,
+    r.published_at,
+    COALESCE(lk.total_likes, 0)::BIGINT AS total_likes,
+    COALESCE(le.total_listens, 0)::BIGINT AS total_listens,
+    r.id AS id,
+    CASE
+        WHEN rc.use_pseudonym = TRUE AND rc.pseudonym IS NOT NULL AND TRIM(rc.pseudonym) <> '' THEN rc.pseudonym
+        ELSE rc.display_name
+    END AS reciter_name,
+    rc.profile_image_path AS reciter_avatar,
+    rc.country AS reciter_country,
+    CASE
+        WHEN r.ayah_start = 1 AND (
+            (r.surah_number = 1 AND r.ayah_end = 7) OR
+            (r.surah_number = 108 AND r.ayah_end = 3) OR
+            (r.ayah_end <= r.ayah_start)
+        ) THEN 'كاملة'
+        ELSE 'الآيات ' || r.ayah_start || ' - ' || r.ayah_end
+    END AS ayah_range,
+    r.description,
+    r.created_at
+FROM public.recitations r
+JOIN public.reciters rc ON r.reciter_id = rc.id
+LEFT JOIN (
+    SELECT recitation_id, COUNT(*) AS total_likes
+    FROM public.likes
+    GROUP BY recitation_id
+) lk ON lk.recitation_id = r.id
+LEFT JOIN (
+    SELECT recitation_id, COUNT(*) AS total_listens
+    FROM public.listen_events
+    GROUP BY recitation_id
+) le ON le.recitation_id = r.id
+WHERE r.status = 'APPROVED' AND rc.is_published = TRUE;
+
+GRANT SELECT ON public.reciter_statistics_view TO anon, authenticated;
+GRANT SELECT ON public.recitation_statistics_view TO anon, authenticated;
+
+-- ----------------------------------------------------------------------------
+-- 3. Secure Administrative Metrics RPC
 -- ----------------------------------------------------------------------------
 CREATE OR REPLACE FUNCTION public.get_admin_dashboard_metrics()
 RETURNS JSON AS $$
 DECLARE
-    result JSON;
+    v_total_reciters INT;
+    v_published_reciters INT;
+    v_total_recitations INT;
+    v_published_recitations INT;
+    v_pending_submissions INT;
+    v_total_listens INT;
+    v_total_likes INT;
+    v_active_competitions INT;
+    v_total_users INT;
 BEGIN
-    -- Strict security authorization check
     IF NOT public.is_admin() THEN
         RAISE EXCEPTION 'Access denied. Administrator privilege required.';
     END IF;
 
-    SELECT json_build_object(
-        'totalReciters', (SELECT COUNT(*) FROM public.reciters),
-        'publishedReciters', (SELECT COUNT(*) FROM public.reciters WHERE is_published = TRUE),
-        'totalRecitations', (SELECT COUNT(*) FROM public.recitations),
-        'publishedRecitations', (SELECT COUNT(*) FROM public.recitations WHERE status = 'APPROVED'),
-        'pendingSubmissions', (SELECT COUNT(*) FROM public.recitation_submissions WHERE status = 'PENDING'),
-        'totalListens', (SELECT COUNT(*) FROM public.listen_events),
-        'totalLikes', (SELECT COUNT(*) FROM public.likes),
-        'activeCompetitions', (SELECT COUNT(*) FROM public.competitions WHERE is_published = TRUE),
-        'totalUsers', (SELECT COUNT(*) FROM public.user_profiles)
-    ) INTO result;
+    SELECT COUNT(*) INTO v_total_reciters FROM public.reciters;
+    SELECT COUNT(*) INTO v_published_reciters FROM public.reciters WHERE is_published = TRUE;
+    SELECT COUNT(*) INTO v_total_recitations FROM public.recitations;
+    SELECT COUNT(*) INTO v_published_recitations FROM public.recitations WHERE status = 'APPROVED';
+    SELECT COUNT(*) INTO v_pending_submissions FROM public.recitation_submissions WHERE status = 'PENDING';
+    SELECT COUNT(*) INTO v_total_listens FROM public.listen_events;
+    SELECT COUNT(*) INTO v_total_likes FROM public.likes;
+    SELECT COUNT(*) INTO v_active_competitions FROM public.competitions WHERE is_published = TRUE;
+    SELECT COUNT(*) INTO v_total_users FROM public.user_profiles;
 
-    RETURN result;
+    RETURN json_build_object(
+        'totalReciters', v_total_reciters,
+        'publishedReciters', v_published_reciters,
+        'totalRecitations', v_total_recitations,
+        'publishedRecitations', v_published_recitations,
+        'pendingSubmissions', v_pending_submissions,
+        'totalListens', v_total_listens,
+        'totalLikes', v_total_likes,
+        'activeCompetitions', v_active_competitions,
+        'totalUsers', v_total_users
+    );
 END;
 $$ LANGUAGE plpgsql SECURITY DEFINER SET search_path = public, pg_temp;
 
 -- ----------------------------------------------------------------------------
--- 3. Secure Administrative Deletion RPCs with Cascade Data Integrity
+-- 4. Secure Cascade Deletion & Broadcast RPCs with Internal is_admin() Checks
 -- ----------------------------------------------------------------------------
 
--- 3.1. Delete Reciter (Cascades honors, featured status, recitations, likes, listen events)
+-- 4.1. Delete Reciter (Cascade cleanup)
 CREATE OR REPLACE FUNCTION public.admin_delete_reciter(p_id UUID)
 RETURNS VOID AS $$
 BEGIN
@@ -78,13 +213,9 @@ BEGIN
         RAISE EXCEPTION 'Access denied. Administrator privilege required.';
     END IF;
 
-    -- Delete related honors
     DELETE FROM public.reciter_honors WHERE reciter_id = p_id;
-
-    -- Delete related featured reciter entries
     DELETE FROM public.featured_reciters WHERE reciter_id = p_id;
 
-    -- Delete related likes and listen events for all recitations of this reciter
     DELETE FROM public.likes WHERE recitation_id IN (
         SELECT id FROM public.recitations WHERE reciter_id = p_id
     );
@@ -92,15 +223,12 @@ BEGIN
         SELECT id FROM public.recitations WHERE reciter_id = p_id
     );
 
-    -- Delete recitations
     DELETE FROM public.recitations WHERE reciter_id = p_id;
-
-    -- Delete reciter record
     DELETE FROM public.reciters WHERE id = p_id;
 END;
 $$ LANGUAGE plpgsql SECURITY DEFINER SET search_path = public, pg_temp;
 
--- 3.2. Delete Recitation (Cascades likes and listen events)
+-- 4.2. Delete Recitation (Cascade cleanup)
 CREATE OR REPLACE FUNCTION public.admin_delete_recitation(p_id UUID)
 RETURNS VOID AS $$
 BEGIN
@@ -114,7 +242,7 @@ BEGIN
 END;
 $$ LANGUAGE plpgsql SECURITY DEFINER SET search_path = public, pg_temp;
 
--- 3.3. Delete Competition
+-- 4.3. Delete Competition
 CREATE OR REPLACE FUNCTION public.admin_delete_competition(p_id UUID)
 RETURNS VOID AS $$
 BEGIN
@@ -126,7 +254,7 @@ BEGIN
 END;
 $$ LANGUAGE plpgsql SECURITY DEFINER SET search_path = public, pg_temp;
 
--- 3.4. Delete Announcement
+-- 4.4. Delete Announcement
 CREATE OR REPLACE FUNCTION public.admin_delete_announcement(p_id UUID)
 RETURNS VOID AS $$
 BEGIN
@@ -138,7 +266,7 @@ BEGIN
 END;
 $$ LANGUAGE plpgsql SECURITY DEFINER SET search_path = public, pg_temp;
 
--- 3.5. Delete Submission
+-- 4.5. Delete Submission
 CREATE OR REPLACE FUNCTION public.admin_delete_submission(p_id UUID)
 RETURNS VOID AS $$
 BEGIN
@@ -150,7 +278,7 @@ BEGIN
 END;
 $$ LANGUAGE plpgsql SECURITY DEFINER SET search_path = public, pg_temp;
 
--- 3.6. Delete User Profile and Associated Notifications
+-- 4.6. Delete User Profile and Associated Notifications
 CREATE OR REPLACE FUNCTION public.admin_delete_user(p_id UUID)
 RETURNS VOID AS $$
 DECLARE
@@ -172,7 +300,7 @@ BEGIN
 END;
 $$ LANGUAGE plpgsql SECURITY DEFINER SET search_path = public, pg_temp;
 
--- 3.7. Delete Admin In-App Notification
+-- 4.7. Delete Admin In-App Notification
 CREATE OR REPLACE FUNCTION public.admin_delete_notification(p_id UUID)
 RETURNS VOID AS $$
 BEGIN
@@ -184,7 +312,7 @@ BEGIN
 END;
 $$ LANGUAGE plpgsql SECURITY DEFINER SET search_path = public, pg_temp;
 
--- 3.8. Send Broadcast Notification to Users
+-- 4.8. Send Broadcast Notification to Users
 CREATE OR REPLACE FUNCTION public.admin_send_broadcast(
     p_title TEXT,
     p_body TEXT,
@@ -200,7 +328,6 @@ BEGIN
         RAISE EXCEPTION 'Access denied. Administrator privilege required.';
     END IF;
 
-    -- Insert targeted notifications into user_notifications table
     INSERT INTO public.user_notifications (
         installation_id,
         title,
@@ -226,20 +353,22 @@ BEGIN
 
     GET DIAGNOSTICS v_dispatched = ROW_COUNT;
 
-    -- Also record in broadcast_notifications history if table exists
-    INSERT INTO public.broadcast_notifications (
-        title,
-        body,
-        target_audience,
-        sent_by,
-        sent_at
-    ) VALUES (
-        p_title,
-        p_body,
-        p_target_type || CASE WHEN p_target_value IS NOT NULL THEN ':' || p_target_value ELSE '' END,
-        auth.uid(),
-        NOW()
-    );
+    -- Also record in broadcast history if table exists
+    IF EXISTS (SELECT 1 FROM information_schema.tables WHERE table_name = 'broadcast_notifications') THEN
+        INSERT INTO public.broadcast_notifications (
+            title,
+            body,
+            target_audience,
+            sent_by,
+            sent_at
+        ) VALUES (
+            p_title,
+            p_body,
+            p_target_type || CASE WHEN p_target_value IS NOT NULL THEN ':' || p_target_value ELSE '' END,
+            auth.uid(),
+            NOW()
+        );
+    END IF;
 
     RETURN json_build_object(
         'success', TRUE,
@@ -249,10 +378,10 @@ END;
 $$ LANGUAGE plpgsql SECURITY DEFINER SET search_path = public, pg_temp;
 
 -- ----------------------------------------------------------------------------
--- 4. Revoke Insecure Permissions and Enforce Principle of Least Privilege
+-- 5. Revocation of Public Admin Execution & Strict Role Grants
 -- ----------------------------------------------------------------------------
 
--- Revoke all permissions on admin functions from PUBLIC and anon roles
+-- Revoke all permissions on admin functions from PUBLIC and anon
 REVOKE ALL ON FUNCTION public.get_admin_dashboard_metrics() FROM PUBLIC, anon;
 REVOKE ALL ON FUNCTION public.admin_delete_reciter(UUID) FROM PUBLIC, anon;
 REVOKE ALL ON FUNCTION public.admin_delete_recitation(UUID) FROM PUBLIC, anon;
@@ -263,7 +392,7 @@ REVOKE ALL ON FUNCTION public.admin_delete_user(UUID) FROM PUBLIC, anon;
 REVOKE ALL ON FUNCTION public.admin_delete_notification(UUID) FROM PUBLIC, anon;
 REVOKE ALL ON FUNCTION public.admin_send_broadcast(TEXT, TEXT, TEXT, TEXT, TEXT) FROM PUBLIC, anon;
 
--- Grant EXECUTE exclusively to authenticated role
+-- Grant EXECUTE on admin functions strictly to authenticated
 GRANT EXECUTE ON FUNCTION public.get_admin_dashboard_metrics() TO authenticated;
 GRANT EXECUTE ON FUNCTION public.admin_delete_reciter(UUID) TO authenticated;
 GRANT EXECUTE ON FUNCTION public.admin_delete_recitation(UUID) TO authenticated;
@@ -274,131 +403,9 @@ GRANT EXECUTE ON FUNCTION public.admin_delete_user(UUID) TO authenticated;
 GRANT EXECUTE ON FUNCTION public.admin_delete_notification(UUID) TO authenticated;
 GRANT EXECUTE ON FUNCTION public.admin_send_broadcast(TEXT, TEXT, TEXT, TEXT, TEXT) TO authenticated;
 
--- Public submission RPC remains accessible to anon & authenticated for visitor contributions
-GRANT EXECUTE ON FUNCTION public.submit_recitation_public TO anon, authenticated;
-GRANT EXECUTE ON FUNCTION public.toggle_recitation_like TO anon, authenticated;
-GRANT EXECUTE ON FUNCTION public.record_listen_event TO anon, authenticated;
-
--- ----------------------------------------------------------------------------
--- 5. Data Views for Operational Consistency & Real Scores
--- ----------------------------------------------------------------------------
-
--- 5.1. Reciter Statistics View (Real-time aggregation with mathematical scoring)
-CREATE OR REPLACE VIEW public.reciter_statistics_view AS
-SELECT
-    r.id,
-    r.display_name,
-    r.pseudonym,
-    r.use_pseudonym,
-    r.gender,
-    r.country,
-    r.bio,
-    r.profile_image_path,
-    r.is_verified,
-    r.is_featured,
-    r.is_published,
-    r.created_at,
-    r.updated_at,
-    COUNT(DISTINCT rec.id) FILTER (WHERE rec.status = 'APPROVED') AS total_recitations,
-    COALESCE(SUM(rec_stats.listen_count), 0) AS total_listens,
-    COALESCE(SUM(rec_stats.like_count), 0) AS total_likes,
-    (
-        COALESCE(SUM(rec_stats.listen_count), 0) * 1.0 +
-        COALESCE(SUM(rec_stats.like_count), 0) * 5.0 +
-        CASE WHEN r.is_featured THEN 50.0 ELSE 0.0 END +
-        CASE WHEN r.is_verified THEN 25.0 ELSE 0.0 END
-    ) AS ranking_score
-FROM public.reciters r
-LEFT JOIN public.recitations rec ON rec.reciter_id = r.id AND rec.status = 'APPROVED'
-LEFT JOIN (
-    SELECT
-        recitation_id,
-        COUNT(DISTINCT id) AS listen_count,
-        0 AS like_count
-    FROM public.listen_events
-    GROUP BY recitation_id
-    UNION ALL
-    SELECT
-        recitation_id,
-        0 AS listen_count,
-        COUNT(DISTINCT id) AS like_count
-    FROM public.likes
-    GROUP BY recitation_id
-) rec_stats ON rec_stats.recitation_id = rec.id
-WHERE r.is_published = TRUE
-GROUP BY r.id, r.display_name, r.pseudonym, r.use_pseudonym, r.gender, r.country, r.bio, r.profile_image_path, r.is_verified, r.is_featured, r.is_published, r.created_at, r.updated_at;
-
--- 5.2. Recitation Statistics View (Real-time aggregation for listen & like counts)
-CREATE OR REPLACE VIEW public.recitation_statistics_view AS
-SELECT
-    rec.id,
-    rec.reciter_id,
-    r.display_name AS reciter_name,
-    r.pseudonym AS reciter_pseudonym,
-    r.profile_image_path AS reciter_avatar,
-    r.country AS reciter_country,
-    rec.surah_name,
-    rec.surah_number,
-    rec.ayah_start,
-    rec.ayah_end,
-    rec.riwayah,
-    rec.duration_seconds,
-    rec.audio_storage_path,
-    rec.external_audio_url,
-    rec.cover_image_path,
-    rec.description,
-    rec.is_staff_pick,
-    rec.status,
-    rec.published_at,
-    rec.created_at,
-    COALESCE(le.listen_count, 0) AS listen_count,
-    COALESCE(lk.like_count, 0) AS like_count
-FROM public.recitations rec
-JOIN public.reciters r ON r.id = rec.reciter_id
-LEFT JOIN (
-    SELECT recitation_id, COUNT(*) AS listen_count
-    FROM public.listen_events
-    GROUP BY recitation_id
-) le ON le.recitation_id = rec.id
-LEFT JOIN (
-    SELECT recitation_id, COUNT(*) AS like_count
-    FROM public.likes
-    GROUP BY recitation_id
-) lk ON lk.recitation_id = rec.id
-WHERE rec.status = 'APPROVED';
-
-GRANT SELECT ON public.reciter_statistics_view TO anon, authenticated;
-GRANT SELECT ON public.recitation_statistics_view TO anon, authenticated;
-
--- ----------------------------------------------------------------------------
--- 6. Trigger for Automatic Admin In-App Notifications on New Submissions
--- ----------------------------------------------------------------------------
-CREATE OR REPLACE FUNCTION public.fn_notify_admin_on_submission()
-RETURNS TRIGGER AS $$
-BEGIN
-    INSERT INTO public.admin_notifications (
-        notification_type,
-        title,
-        content,
-        reference_id,
-        is_read,
-        sent_via_email,
-        created_at
-    ) VALUES (
-        'NEW_SUBMISSION',
-        'طلب نشر تلاوة جديد: ' || COALESCE(NEW.surah_name, 'سورة'),
-        'تم استلام تلاوة جديدة من القارئ (' || COALESCE(NEW.display_name, 'قارئ') || ') برواية (' || COALESCE(NEW.riwayah, 'حفص عن عاصم') || ') وهي بانتظار المراجعة والاعتماد.',
-        NEW.id,
-        FALSE,
-        FALSE,
-        NOW()
-    );
-    RETURN NEW;
-END;
-$$ LANGUAGE plpgsql SECURITY DEFINER SET search_path = public, pg_temp;
-
-DROP TRIGGER IF EXISTS trg_notify_admin_on_submission ON public.recitation_submissions;
-CREATE TRIGGER trg_notify_admin_on_submission
-    AFTER INSERT ON public.recitation_submissions
-    FOR EACH ROW
-    EXECUTE FUNCTION public.fn_notify_admin_on_submission();
+-- Public Visitor Functions: Ensure proper execution grants with verified signatures
+GRANT EXECUTE ON FUNCTION public.is_admin() TO anon, authenticated;
+GRANT EXECUTE ON FUNCTION public.is_super_admin() TO anon, authenticated;
+GRANT EXECUTE ON FUNCTION public.submit_recitation_public(TEXT, TEXT, BOOLEAN, TEXT, TEXT, TEXT, INTEGER, TEXT, INTEGER, INTEGER, TEXT, TEXT, TEXT, TEXT) TO anon, authenticated;
+GRANT EXECUTE ON FUNCTION public.toggle_recitation_like(UUID, TEXT) TO anon, authenticated;
+GRANT EXECUTE ON FUNCTION public.record_listen_event(UUID, TEXT, INTEGER, BOOLEAN) TO anon, authenticated;
