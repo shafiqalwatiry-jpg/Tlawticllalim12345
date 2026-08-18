@@ -569,14 +569,33 @@ class AdminServiceImpl {
   async getSubmissions(status?: SubmissionStatus): Promise<RecitationSubmission[]> {
     let url = `${SUPABASE_CONFIG.restBaseUrl}/recitation_submissions?select=*&order=created_at.desc`;
     if (status) {
-      url += `&status=eq.${status.toUpperCase()}`;
+      url += `&status=in.(${encodeURIComponent(status.toUpperCase())},${encodeURIComponent(status.toLowerCase())})`;
     }
 
     const res = await fetch(url, { headers: this.getAuthHeaders() });
-    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    if (!res.ok) {
+      // Fallback query without status filter if filtered query returned error
+      const fbRes = await fetch(`${SUPABASE_CONFIG.restBaseUrl}/recitation_submissions?select=*&order=created_at.desc`, {
+        headers: this.getAuthHeaders()
+      });
+      if (fbRes.ok) {
+        const fbRows = await fbRes.json();
+        if (Array.isArray(fbRows)) {
+          const filtered = status
+            ? fbRows.filter((r: any) => r.status?.toLowerCase() === status.toLowerCase())
+            : fbRows;
+          return filtered.map((r: any) => this.mapSubmissionRow(r));
+        }
+      }
+      throw new Error(`HTTP ${res.status}`);
+    }
     const rows = await res.json();
 
-    return rows.map((r: any) => ({
+    return rows.map((r: any) => this.mapSubmissionRow(r));
+  }
+
+  private mapSubmissionRow(r: any): RecitationSubmission {
+    return {
       id: r.id,
       displayName: r.display_name,
       pseudonym: r.pseudonym,
@@ -596,9 +615,9 @@ class AdminServiceImpl {
       externalImageUrl: r.profile_image_path,
       agreeToTerms: true,
       submittedAt: r.created_at,
-      status: r.status?.toLowerCase() as SubmissionStatus,
+      status: (r.status?.toLowerCase() || 'pending') as SubmissionStatus,
       adminNotes: r.admin_notes
-    }));
+    };
   }
 
   async updateSubmissionStatus(

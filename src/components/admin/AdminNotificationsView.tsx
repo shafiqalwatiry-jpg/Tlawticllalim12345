@@ -24,7 +24,9 @@ import {
   Globe,
   Radio,
   UserCheck,
-  Check
+  Check,
+  Search,
+  User as UserIcon
 } from 'lucide-react';
 
 export function AdminNotificationsView() {
@@ -41,6 +43,10 @@ export function AdminNotificationsView() {
   const [targetCountry, setTargetCountry] = useState('المملكة العربية السعودية');
   const [targetUserType, setTargetUserType] = useState('LISTENER');
   const [targetUserId, setTargetUserId] = useState('');
+  const [selectedUserObj, setSelectedUserObj] = useState<any | null>(null);
+  const [usersList, setUsersList] = useState<any[]>([]);
+  const [isLoadingUsers, setIsLoadingUsers] = useState(false);
+  const [userSearchQuery, setUserSearchQuery] = useState('');
   const [isSending, setIsSending] = useState(false);
   const [sendSuccessMsg, setSendSuccessMsg] = useState<string | null>(null);
   const [sendErrorMsg, setSendErrorMsg] = useState<string | null>(null);
@@ -58,9 +64,27 @@ export function AdminNotificationsView() {
     }
   };
 
+  const loadUsers = async () => {
+    setIsLoadingUsers(true);
+    try {
+      const data = await adminService.getUsers();
+      setUsersList(data || []);
+    } catch (e) {
+      console.warn('Failed to load users for selector:', e);
+    } finally {
+      setIsLoadingUsers(false);
+    }
+  };
+
   useEffect(() => {
     loadNotifications();
   }, []);
+
+  useEffect(() => {
+    if (targetType === 'specific_user' && usersList.length === 0) {
+      loadUsers();
+    }
+  }, [targetType]);
 
   const handleMarkAsRead = async (id: string) => {
     setNotifications((prev) =>
@@ -507,18 +531,146 @@ export function AdminNotificationsView() {
             )}
 
             {targetType === 'specific_user' && (
-              <div className="p-4 rounded-2xl bg-[#0A1410] border border-[#234235] space-y-2">
-                <label className="block text-xs font-bold text-[#E8EFEA] mb-1">
-                  معرّف المستخدم (ID أو Installation ID)
-                </label>
-                <input
-                  type="text"
-                  required
-                  value={targetUserId}
-                  onChange={(e) => setTargetUserId(e.target.value)}
-                  placeholder="ألصق معرّف المستخدم هنا..."
-                  className="w-full px-3.5 py-2.5 rounded-xl bg-[#12231B] border border-[#234235] text-xs text-white placeholder-[#5A7B6C] focus:outline-hidden focus:border-[#55BFEA]"
-                />
+              <div className="p-4 rounded-2xl bg-[#0A1410] border border-[#234235] space-y-3">
+                <div className="flex items-center justify-between">
+                  <label className="block text-xs font-bold text-[#E8EFEA]">
+                    اختر المستخدم المستهدف من القائمة
+                  </label>
+                  <button
+                    type="button"
+                    onClick={loadUsers}
+                    disabled={isLoadingUsers}
+                    className="text-[11px] text-[#55BFEA] hover:underline flex items-center gap-1"
+                  >
+                    <RefreshCw className={`w-3 h-3 ${isLoadingUsers ? 'animate-spin' : ''}`} />
+                    <span>تحديث قائمة المستخدمين</span>
+                  </button>
+                </div>
+
+                {/* Search Bar for Users */}
+                <div className="relative">
+                  <input
+                    type="text"
+                    value={userSearchQuery}
+                    onChange={(e) => setUserSearchQuery(e.target.value)}
+                    placeholder="ابحث باسم المستخدم، الدولة، أو الفئة..."
+                    className="w-full pl-3 pr-8 py-2 rounded-xl bg-[#12231B] border border-[#234235] text-xs text-white placeholder-[#5A7B6C] focus:outline-hidden focus:border-[#55BFEA]"
+                  />
+                  <Search className="w-3.5 h-3.5 text-[#5A7B6C] absolute right-2.5 top-2.5 pointer-events-none" />
+                </div>
+
+                {/* Users List Box */}
+                {isLoadingUsers ? (
+                  <div className="py-6 text-center text-xs text-[#8BA496]">
+                    <div className="w-5 h-5 border-2 border-[#55BFEA]/30 border-t-[#55BFEA] rounded-full animate-spin mx-auto mb-2"></div>
+                    جاري تحميل المستخدمين والزوار...
+                  </div>
+                ) : usersList.length === 0 ? (
+                  <div className="py-4 text-center text-xs text-[#8BA496] bg-[#12231B] rounded-xl border border-[#234235]">
+                    لا يوجد مستخدمون مسجلون بعد. يمكنك إدخال معرّف يدويًا أدناه.
+                  </div>
+                ) : (
+                  <div className="max-h-48 overflow-y-auto space-y-1.5 pr-1 scrollbar-thin scrollbar-thumb-[#234235]">
+                    {usersList
+                      .filter((u) => {
+                        const q = userSearchQuery.toLowerCase();
+                        return (
+                          u.displayName.toLowerCase().includes(q) ||
+                          u.country.toLowerCase().includes(q) ||
+                          (u.email && u.email.toLowerCase().includes(q)) ||
+                          u.installationId.toLowerCase().includes(q)
+                        );
+                      })
+                      .map((u) => {
+                        const isSelected = targetUserId === u.installationId || targetUserId === u.id;
+                        return (
+                          <div
+                            key={u.id || u.installationId}
+                            onClick={() => {
+                              setTargetUserId(u.installationId || u.id);
+                              setSelectedUserObj(u);
+                            }}
+                            className={`p-2.5 rounded-xl border cursor-pointer flex items-center justify-between gap-2 transition ${
+                              isSelected
+                                ? 'bg-[#143B2A] border-[#3D8F66] text-white shadow-xs'
+                                : 'bg-[#12231B] border-[#234235] text-[#A8C2B3] hover:bg-[#162C22]'
+                            }`}
+                          >
+                            <div className="flex items-center gap-2.5 min-w-0">
+                              {u.avatarUrl ? (
+                                <img
+                                  src={u.avatarUrl}
+                                  alt={u.displayName}
+                                  className="w-7 h-7 rounded-full object-cover border border-[#3D6E58] shrink-0"
+                                />
+                              ) : (
+                                <div className="w-7 h-7 rounded-full bg-[#1A3328] border border-[#2B5742] flex items-center justify-center text-xs text-[#55BFEA] shrink-0 font-bold">
+                                  {u.displayName.charAt(0)}
+                                </div>
+                              )}
+                              <div className="min-w-0">
+                                <div className="text-xs font-bold text-white truncate flex items-center gap-1.5">
+                                  <span>{u.displayName}</span>
+                                  {u.isProfileCompleted && (
+                                    <span className="text-[9px] px-1.5 py-0.5 rounded-md bg-emerald-500/20 text-emerald-300 font-normal">
+                                      مكتمل
+                                    </span>
+                                  )}
+                                </div>
+                                <div className="text-[10px] text-[#6E8E7E] truncate">
+                                  {u.country} • {u.userType === 'RECITER' ? 'قارئ' : u.userType === 'BOTH' ? 'قارئ ومستمع' : 'مستمع'}
+                                </div>
+                              </div>
+                            </div>
+
+                            <div className="shrink-0 flex items-center">
+                              {isSelected ? (
+                                <div className="w-5 h-5 rounded-full bg-emerald-500 text-white flex items-center justify-center">
+                                  <Check className="w-3 h-3" />
+                                </div>
+                              ) : (
+                                <span className="text-[10px] text-[#55BFEA] hover:underline">اختيار</span>
+                              )}
+                            </div>
+                          </div>
+                        );
+                      })}
+                  </div>
+                )}
+
+                {/* Manual Fallback or Selected Confirmation */}
+                {selectedUserObj && (
+                  <div className="p-2.5 rounded-xl bg-[#142B20] border border-[#2B5742] text-[11px] text-[#A8C2B3] flex items-center justify-between">
+                    <span className="text-emerald-300 font-bold">المستخدم المحدد: {selectedUserObj.displayName} ({selectedUserObj.country})</span>
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setSelectedUserObj(null);
+                        setTargetUserId('');
+                      }}
+                      className="text-rose-400 hover:underline"
+                    >
+                      إلغاء
+                    </button>
+                  </div>
+                )}
+
+                <div>
+                  <label className="block text-[10px] text-[#8BA496] mb-1">
+                    معرّف المستخدم المختار (ID أو Installation ID)
+                  </label>
+                  <input
+                    type="text"
+                    required
+                    value={targetUserId}
+                    onChange={(e) => {
+                      setTargetUserId(e.target.value);
+                      setSelectedUserObj(null);
+                    }}
+                    placeholder="يمكنك أيضًا لصق معرّف المستخدم مباشرة هنا..."
+                    className="w-full px-3 py-1.5 rounded-xl bg-[#12231B] border border-[#234235] text-[11px] text-white placeholder-[#5A7B6C] focus:outline-hidden focus:border-[#55BFEA]"
+                  />
+                </div>
               </div>
             )}
 

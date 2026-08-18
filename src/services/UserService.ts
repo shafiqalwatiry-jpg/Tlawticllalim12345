@@ -23,6 +23,7 @@ export class UserService {
       this.initInstallation();
       this.loadLocalProfile();
       this.loadNotifications();
+      this.ensureVisitorRegistered();
     }
   }
 
@@ -40,6 +41,38 @@ export class UserService {
       localStorage.setItem(INSTALLATION_KEY, installId);
     }
     this.currentInstallationId = installId;
+  }
+
+  public async ensureVisitorRegistered(): Promise<void> {
+    const installId = this.getInstallationId();
+    const profile = this.getProfile();
+    try {
+      const payload = {
+        installation_id: installId,
+        display_name: profile.displayName || 'زائر المنصة',
+        avatar_url: profile.avatarUrl || null,
+        country: profile.country || 'العالم الإسلامي',
+        user_type: profile.userType || 'LISTENER',
+        bio: profile.bio || '',
+        email: profile.email || null,
+        whatsapp: profile.whatsapp || null,
+        is_profile_completed: profile.isProfileCompleted ?? false,
+        last_active_at: new Date().toISOString()
+      };
+
+      await fetch(`${SUPABASE_CONFIG.restBaseUrl}/user_profiles`, {
+        method: 'POST',
+        headers: {
+          'apikey': SUPABASE_CONFIG.anonKey,
+          'Authorization': `Bearer ${SUPABASE_CONFIG.anonKey}`,
+          'Content-Type': 'application/json',
+          'Prefer': 'resolution=merge-duplicates'
+        },
+        body: JSON.stringify(payload)
+      });
+    } catch (e) {
+      console.warn('Auto register visitor profile skipped:', e);
+    }
   }
 
   public getInstallationId(): string {

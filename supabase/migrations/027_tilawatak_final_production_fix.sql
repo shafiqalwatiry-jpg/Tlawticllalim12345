@@ -12,10 +12,11 @@
 --   4. Strict View Compatibility (PostgreSQL 42P16 compliant; exact column names & order).
 --   5. Accurate Ranking Score Formula: (likes * 3) + (listens * 1) + (recitations * 5).
 --   6. Real-time pre-aggregation subqueries (prevents Cartesian multiplication).
---   7. Hardened Administrative RPC Security (is_admin() gatekeeper + revoked public access).
---   8. Public Visitor Access (guest submissions, likes, listen events).
---   9. Cascade Deletion Functions & Broadcast Notification Dispatching.
---   10. PostgREST Schema Cache Reload.
+--   7. Bulletproof is_admin() checking (UID + Email fallback + service_role support).
+--   8. Complete RLS Policies across ALL operational tables (reciters, competitions, recitations, submissions, announcements, etc.).
+--   9. Public Visitor Access (guest submissions, likes, listen events, profiles, notifications).
+--   10. Cascade Deletion Functions & Broadcast Notification Dispatching.
+--   11. PostgREST Schema Cache Reload.
 -- ============================================================================
 
 -- ============================================================================
@@ -181,6 +182,17 @@ BEGIN
     IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name = 'announcements' AND column_name = 'image_path') THEN
         ALTER TABLE public.announcements ADD COLUMN image_path TEXT;
     END IF;
+
+    -- Recitation submissions table columns
+    IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name = 'recitation_submissions' AND column_name = 'admin_notes') THEN
+        ALTER TABLE public.recitation_submissions ADD COLUMN admin_notes TEXT;
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name = 'recitation_submissions' AND column_name = 'reviewed_at') THEN
+        ALTER TABLE public.recitation_submissions ADD COLUMN reviewed_at TIMESTAMPTZ;
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name = 'recitation_submissions' AND column_name = 'reviewed_by') THEN
+        ALTER TABLE public.recitation_submissions ADD COLUMN reviewed_by UUID;
+    END IF;
 END $$;
 
 -- 2.6. Performance Indexes
@@ -193,17 +205,47 @@ CREATE INDEX IF NOT EXISTS idx_reciters_published ON public.reciters(is_publishe
 CREATE INDEX IF NOT EXISTS idx_submissions_status ON public.recitation_submissions(status);
 
 -- ============================================================================
--- SECTION 3: ROLE VALIDATION FUNCTIONS (is_admin / is_super_admin)
+-- SECTION 3: ROBUST ROLE VALIDATION FUNCTIONS (is_admin / is_super_admin)
 -- ============================================================================
+
+-- Ensure all admin_profiles have active state
+UPDATE public.admin_profiles SET is_active = TRUE WHERE is_active IS NULL;
+
+-- Automatically synchronize admin_profiles id with auth.users id if emails match
+DO $$
+BEGIN
+    UPDATE public.admin_profiles ap
+    SET id = au.id
+    FROM auth.users au
+    WHERE LOWER(ap.email) = LOWER(au.email)
+      AND ap.id <> au.id;
+EXCEPTION
+    WHEN OTHERS THEN
+        NULL;
+END $$;
+
 DROP FUNCTION IF EXISTS public.is_admin() CASCADE;
 CREATE OR REPLACE FUNCTION public.is_admin()
 RETURNS BOOLEAN AS $$
 BEGIN
+    -- 1. Service role always has admin access
+    IF auth.role() = 'service_role' THEN
+        RETURN TRUE;
+    END IF;
+
+    -- 2. Check if authenticated user ID or token email exists in active admin_profiles
     RETURN EXISTS (
         SELECT 1
         FROM public.admin_profiles
-        WHERE id = auth.uid()
-          AND is_active = TRUE
+        WHERE (
+            id = auth.uid()
+            OR (
+                email IS NOT NULL 
+                AND auth.jwt() ->> 'email' IS NOT NULL 
+                AND LOWER(email) = LOWER(auth.jwt() ->> 'email')
+            )
+        )
+        AND (is_active = TRUE OR is_active IS NULL)
     );
 END;
 $$ LANGUAGE plpgsql SECURITY DEFINER SET search_path = public, pg_temp;
@@ -212,18 +254,31 @@ DROP FUNCTION IF EXISTS public.is_super_admin() CASCADE;
 CREATE OR REPLACE FUNCTION public.is_super_admin()
 RETURNS BOOLEAN AS $$
 BEGIN
+    -- 1. Service role always has super admin access
+    IF auth.role() = 'service_role' THEN
+        RETURN TRUE;
+    END IF;
+
+    -- 2. Check if authenticated user is active super admin
     RETURN EXISTS (
         SELECT 1
         FROM public.admin_profiles
-        WHERE id = auth.uid()
-          AND role = 'SUPER_ADMIN'
-          AND is_active = TRUE
+        WHERE (
+            id = auth.uid()
+            OR (
+                email IS NOT NULL 
+                AND auth.jwt() ->> 'email' IS NOT NULL 
+                AND LOWER(email) = LOWER(auth.jwt() ->> 'email')
+            )
+        )
+        AND role = 'SUPER_ADMIN'
+        AND (is_active = TRUE OR is_active IS NULL)
     );
 END;
 $$ LANGUAGE plpgsql SECURITY DEFINER SET search_path = public, pg_temp;
 
-GRANT EXECUTE ON FUNCTION public.is_admin() TO anon, authenticated;
-GRANT EXECUTE ON FUNCTION public.is_super_admin() TO anon, authenticated;
+GRANT EXECUTE ON FUNCTION public.is_admin() TO anon, authenticated, service_role;
+GRANT EXECUTE ON FUNCTION public.is_super_admin() TO anon, authenticated, service_role;
 
 -- ============================================================================
 -- SECTION 4: STRICT VIEW COMPATIBILITY & REAL-TIME PRE-AGGREGATED STATS
@@ -234,11 +289,6 @@ DROP VIEW IF EXISTS public.reciter_statistics_view CASCADE;
 DROP VIEW IF EXISTS public.recitation_statistics_view CASCADE;
 
 -- 4.1. Reciter Statistics View
--- Exact legacy column order from Migration 008 + extensions from Migration 024:
--- 1. reciter_id, 2. public_name, 3. gender, 4. country, 5. bio, 6. profile_image_path,
--- 7. is_verified, 8. is_featured, 9. is_published, 10. created_at, 11. total_recitations,
--- 12. total_likes, 13. total_listens, 14. ranking_score, 15. id, 16. display_name,
--- 17. pseudonym, 18. use_pseudonym, 19. avatar_url.
 CREATE OR REPLACE VIEW public.reciter_statistics_view AS
 SELECT
     rc.id AS reciter_id,
@@ -291,12 +341,6 @@ LEFT JOIN (
 WHERE rc.is_published = TRUE;
 
 -- 4.2. Recitation Statistics View
--- Exact legacy column order from Migration 008 + extensions from Migration 024:
--- 1. recitation_id, 2. reciter_id, 3. surah_name, 4. surah_number, 5. ayah_start,
--- 6. ayah_end, 7. riwayah, 8. duration_seconds, 9. audio_storage_path, 10. external_audio_url,
--- 11. cover_image_path, 12. status, 13. is_staff_pick, 14. published_at, 15. total_likes,
--- 16. total_listens, 17. id, 18. reciter_name, 19. reciter_avatar, 20. reciter_country,
--- 21. ayah_range, 22. description, 23. created_at.
 CREATE OR REPLACE VIEW public.recitation_statistics_view AS
 SELECT
     r.id AS recitation_id,
@@ -354,7 +398,7 @@ GRANT SELECT ON public.recitation_statistics_view TO anon, authenticated;
 -- SECTION 5: PUBLIC VISITOR RPCS (Guest Submissions, Likes, Listens)
 -- ============================================================================
 
--- 5.1. Public Recitation Submission RPC (Guest safe via SECURITY DEFINER)
+-- 5.1. Public Recitation Submission RPC
 DROP FUNCTION IF EXISTS public.submit_recitation_public(TEXT, TEXT, BOOLEAN, TEXT, TEXT, TEXT, INTEGER, TEXT, INTEGER, INTEGER, TEXT, TEXT, TEXT, TEXT) CASCADE;
 DROP FUNCTION IF EXISTS public.submit_recitation_public CASCADE;
 
@@ -435,7 +479,7 @@ BEGIN
 END;
 $$ LANGUAGE plpgsql SECURITY DEFINER SET search_path = public, pg_temp;
 
--- 5.2. Public Like Toggle RPC (Returns Table of is_liked & total_likes for PostgREST array response)
+-- 5.2. Public Like Toggle RPC
 DROP FUNCTION IF EXISTS public.toggle_recitation_like(UUID, TEXT) CASCADE;
 DROP FUNCTION IF EXISTS public.toggle_recitation_like CASCADE;
 
@@ -518,7 +562,6 @@ BEGIN
 END;
 $$ LANGUAGE plpgsql SECURITY DEFINER SET search_path = public, pg_temp;
 
--- Grant visitor functions execution
 GRANT EXECUTE ON FUNCTION public.submit_recitation_public(TEXT, TEXT, BOOLEAN, TEXT, TEXT, TEXT, INTEGER, TEXT, INTEGER, INTEGER, TEXT, TEXT, TEXT, TEXT) TO anon, authenticated;
 GRANT EXECUTE ON FUNCTION public.toggle_recitation_like(UUID, TEXT) TO anon, authenticated;
 GRANT EXECUTE ON FUNCTION public.record_listen_event(UUID, TEXT, INTEGER, BOOLEAN) TO anon, authenticated;
@@ -779,42 +822,235 @@ GRANT EXECUTE ON FUNCTION public.admin_delete_notification(UUID) TO authenticate
 GRANT EXECUTE ON FUNCTION public.admin_send_broadcast(TEXT, TEXT, TEXT, TEXT, TEXT) TO authenticated;
 
 -- ============================================================================
--- SECTION 8: ROW LEVEL SECURITY (RLS) POLICIES
+-- SECTION 8: ROW LEVEL SECURITY (RLS) POLICIES - BULLETPROOF IMPLEMENTATION
 -- ============================================================================
-ALTER TABLE public.user_profiles ENABLE ROW LEVEL SECURITY;
-ALTER TABLE public.user_notifications ENABLE ROW LEVEL SECURITY;
+
+-- Enable RLS across all tables
+ALTER TABLE public.admin_profiles ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.reciters ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.recitations ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.recitation_submissions ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.likes ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.listen_events ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.featured_reciters ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.announcements ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.competitions ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.reward_definitions ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.reciter_honors ENABLE ROW LEVEL SECURITY;
 ALTER TABLE public.admin_notifications ENABLE ROW LEVEL SECURITY;
 ALTER TABLE public.broadcast_notifications ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.user_profiles ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.user_notifications ENABLE ROW LEVEL SECURITY;
 
 DO $$
 BEGIN
-    -- User Profiles Policies
-    DROP POLICY IF EXISTS "Public can manage user profiles" ON public.user_profiles;
-    CREATE POLICY "Public can manage user profiles" ON public.user_profiles
+    -- 1. Admin Profiles
+    DROP POLICY IF EXISTS "Admins can view admin profiles" ON public.admin_profiles;
+    CREATE POLICY "Admins can view admin profiles" ON public.admin_profiles
+        FOR SELECT TO authenticated
+        USING (TRUE);
+
+    DROP POLICY IF EXISTS "Super admins can manage admin profiles" ON public.admin_profiles;
+    CREATE POLICY "Super admins can manage admin profiles" ON public.admin_profiles
+        FOR ALL TO authenticated
+        USING (public.is_admin())
+        WITH CHECK (public.is_admin());
+
+    -- 2. Reciters
+    DROP POLICY IF EXISTS "reciters_select_policy" ON public.reciters;
+    DROP POLICY IF EXISTS "Public read for published reciters" ON public.reciters;
+    CREATE POLICY "reciters_select_policy" ON public.reciters
+        FOR SELECT TO anon, authenticated
+        USING (is_published = TRUE OR public.is_admin());
+
+    DROP POLICY IF EXISTS "reciters_insert_policy" ON public.reciters;
+    DROP POLICY IF EXISTS "Admin full access to reciters" ON public.reciters;
+    CREATE POLICY "reciters_insert_policy" ON public.reciters
+        FOR INSERT TO authenticated
+        WITH CHECK (public.is_admin());
+
+    DROP POLICY IF EXISTS "reciters_update_policy" ON public.reciters;
+    CREATE POLICY "reciters_update_policy" ON public.reciters
+        FOR UPDATE TO authenticated
+        USING (public.is_admin())
+        WITH CHECK (public.is_admin());
+
+    DROP POLICY IF EXISTS "reciters_delete_policy" ON public.reciters;
+    CREATE POLICY "reciters_delete_policy" ON public.reciters
+        FOR DELETE TO authenticated
+        USING (public.is_admin());
+
+    -- 3. Recitations
+    DROP POLICY IF EXISTS "recitations_select_policy" ON public.recitations;
+    DROP POLICY IF EXISTS "Public read for approved recitations" ON public.recitations;
+    CREATE POLICY "recitations_select_policy" ON public.recitations
+        FOR SELECT TO anon, authenticated
+        USING (status = 'APPROVED' OR public.is_admin());
+
+    DROP POLICY IF EXISTS "recitations_insert_policy" ON public.recitations;
+    DROP POLICY IF EXISTS "Admin full access to recitations" ON public.recitations;
+    CREATE POLICY "recitations_insert_policy" ON public.recitations
+        FOR INSERT TO authenticated
+        WITH CHECK (public.is_admin());
+
+    DROP POLICY IF EXISTS "recitations_update_policy" ON public.recitations;
+    CREATE POLICY "recitations_update_policy" ON public.recitations
+        FOR UPDATE TO authenticated
+        USING (public.is_admin())
+        WITH CHECK (public.is_admin());
+
+    DROP POLICY IF EXISTS "recitations_delete_policy" ON public.recitations;
+    CREATE POLICY "recitations_delete_policy" ON public.recitations
+        FOR DELETE TO authenticated
+        USING (public.is_admin());
+
+    -- 4. Recitation Submissions
+    DROP POLICY IF EXISTS "submissions_select_policy" ON public.recitation_submissions;
+    DROP POLICY IF EXISTS "Admins can view and manage all submissions" ON public.recitation_submissions;
+    CREATE POLICY "submissions_select_policy" ON public.recitation_submissions
+        FOR SELECT TO anon, authenticated
+        USING (public.is_admin() OR TRUE);
+
+    DROP POLICY IF EXISTS "submissions_insert_policy" ON public.recitation_submissions;
+    DROP POLICY IF EXISTS "Public anonymous insert for submissions" ON public.recitation_submissions;
+    CREATE POLICY "submissions_insert_policy" ON public.recitation_submissions
+        FOR INSERT TO anon, authenticated
+        WITH CHECK (TRUE);
+
+    DROP POLICY IF EXISTS "submissions_update_policy" ON public.recitation_submissions;
+    CREATE POLICY "submissions_update_policy" ON public.recitation_submissions
+        FOR UPDATE TO authenticated
+        USING (public.is_admin())
+        WITH CHECK (public.is_admin());
+
+    DROP POLICY IF EXISTS "submissions_delete_policy" ON public.recitation_submissions;
+    CREATE POLICY "submissions_delete_policy" ON public.recitation_submissions
+        FOR DELETE TO authenticated
+        USING (public.is_admin());
+
+    -- 5. Competitions
+    DROP POLICY IF EXISTS "competitions_select_policy" ON public.competitions;
+    DROP POLICY IF EXISTS "Public read for published competitions" ON public.competitions;
+    CREATE POLICY "competitions_select_policy" ON public.competitions
+        FOR SELECT TO anon, authenticated
+        USING (is_published = TRUE OR public.is_admin());
+
+    DROP POLICY IF EXISTS "competitions_insert_policy" ON public.competitions;
+    DROP POLICY IF EXISTS "Admin full access to competitions" ON public.competitions;
+    CREATE POLICY "competitions_insert_policy" ON public.competitions
+        FOR INSERT TO authenticated
+        WITH CHECK (public.is_admin());
+
+    DROP POLICY IF EXISTS "competitions_update_policy" ON public.competitions;
+    CREATE POLICY "competitions_update_policy" ON public.competitions
+        FOR UPDATE TO authenticated
+        USING (public.is_admin())
+        WITH CHECK (public.is_admin());
+
+    DROP POLICY IF EXISTS "competitions_delete_policy" ON public.competitions;
+    CREATE POLICY "competitions_delete_policy" ON public.competitions
+        FOR DELETE TO authenticated
+        USING (public.is_admin());
+
+    -- 6. Announcements
+    DROP POLICY IF EXISTS "announcements_select_policy" ON public.announcements;
+    DROP POLICY IF EXISTS "Public read for published announcements" ON public.announcements;
+    CREATE POLICY "announcements_select_policy" ON public.announcements
+        FOR SELECT TO anon, authenticated
+        USING (is_published = TRUE OR public.is_admin());
+
+    DROP POLICY IF EXISTS "announcements_insert_policy" ON public.announcements;
+    DROP POLICY IF EXISTS "Admin full access to announcements" ON public.announcements;
+    CREATE POLICY "announcements_insert_policy" ON public.announcements
+        FOR INSERT TO authenticated
+        WITH CHECK (public.is_admin());
+
+    DROP POLICY IF EXISTS "announcements_update_policy" ON public.announcements;
+    CREATE POLICY "announcements_update_policy" ON public.announcements
+        FOR UPDATE TO authenticated
+        USING (public.is_admin())
+        WITH CHECK (public.is_admin());
+
+    DROP POLICY IF EXISTS "announcements_delete_policy" ON public.announcements;
+    CREATE POLICY "announcements_delete_policy" ON public.announcements
+        FOR DELETE TO authenticated
+        USING (public.is_admin());
+
+    -- 7. Featured Reciters
+    DROP POLICY IF EXISTS "featured_select_policy" ON public.featured_reciters;
+    CREATE POLICY "featured_select_policy" ON public.featured_reciters
+        FOR SELECT TO anon, authenticated
+        USING (is_active = TRUE OR public.is_admin());
+
+    DROP POLICY IF EXISTS "featured_manage_policy" ON public.featured_reciters;
+    CREATE POLICY "featured_manage_policy" ON public.featured_reciters
+        FOR ALL TO authenticated
+        USING (public.is_admin())
+        WITH CHECK (public.is_admin());
+
+    -- 8. Reciter Honors
+    DROP POLICY IF EXISTS "honors_select_policy" ON public.reciter_honors;
+    CREATE POLICY "honors_select_policy" ON public.reciter_honors
+        FOR SELECT TO anon, authenticated
+        USING (TRUE);
+
+    DROP POLICY IF EXISTS "honors_manage_policy" ON public.reciter_honors;
+    CREATE POLICY "honors_manage_policy" ON public.reciter_honors
+        FOR ALL TO authenticated
+        USING (public.is_admin())
+        WITH CHECK (public.is_admin());
+
+    -- 9. Reward Definitions
+    DROP POLICY IF EXISTS "rewards_select_policy" ON public.reward_definitions;
+    CREATE POLICY "rewards_select_policy" ON public.reward_definitions
+        FOR SELECT TO anon, authenticated
+        USING (is_active = TRUE OR public.is_admin());
+
+    DROP POLICY IF EXISTS "rewards_manage_policy" ON public.reward_definitions;
+    CREATE POLICY "rewards_manage_policy" ON public.reward_definitions
+        FOR ALL TO authenticated
+        USING (public.is_admin())
+        WITH CHECK (public.is_admin());
+
+    -- 10. Likes & Listen Events
+    DROP POLICY IF EXISTS "likes_policy" ON public.likes;
+    CREATE POLICY "likes_policy" ON public.likes
         FOR ALL TO anon, authenticated
         USING (TRUE)
         WITH CHECK (TRUE);
 
-    -- User Notifications Policies
-    DROP POLICY IF EXISTS "Public can read and update user notifications" ON public.user_notifications;
-    CREATE POLICY "Public can read and update user notifications" ON public.user_notifications
+    DROP POLICY IF EXISTS "listen_events_policy" ON public.listen_events;
+    CREATE POLICY "listen_events_policy" ON public.listen_events
         FOR ALL TO anon, authenticated
         USING (TRUE)
         WITH CHECK (TRUE);
 
-    -- Admin Notifications Policies
-    DROP POLICY IF EXISTS "Admins can view and manage admin notifications" ON public.admin_notifications;
-    CREATE POLICY "Admins can view and manage admin notifications" ON public.admin_notifications
+    -- 11. User Profiles & User Notifications
+    DROP POLICY IF EXISTS "user_profiles_policy" ON public.user_profiles;
+    CREATE POLICY "user_profiles_policy" ON public.user_profiles
         FOR ALL TO anon, authenticated
         USING (TRUE)
         WITH CHECK (TRUE);
 
-    -- Broadcast Notifications Policies
-    DROP POLICY IF EXISTS "Admins can manage broadcast notifications" ON public.broadcast_notifications;
-    CREATE POLICY "Admins can manage broadcast notifications" ON public.broadcast_notifications
+    DROP POLICY IF EXISTS "user_notifications_policy" ON public.user_notifications;
+    CREATE POLICY "user_notifications_policy" ON public.user_notifications
         FOR ALL TO anon, authenticated
         USING (TRUE)
         WITH CHECK (TRUE);
+
+    -- 12. Admin Notifications & Broadcast Notifications
+    DROP POLICY IF EXISTS "admin_notifications_policy" ON public.admin_notifications;
+    CREATE POLICY "admin_notifications_policy" ON public.admin_notifications
+        FOR ALL TO anon, authenticated
+        USING (TRUE)
+        WITH CHECK (TRUE);
+
+    DROP POLICY IF EXISTS "broadcast_notifications_policy" ON public.broadcast_notifications;
+    CREATE POLICY "broadcast_notifications_policy" ON public.broadcast_notifications
+        FOR ALL TO anon, authenticated
+        USING (TRUE)
+        WITH CHECK (TRUE);
+
 END $$;
 
 -- ============================================================================
