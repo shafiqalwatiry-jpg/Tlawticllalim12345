@@ -8,13 +8,14 @@
 --   Key Inclusions:
 --   1. Clean-slate safe test data purge (preserves admin accounts, rewards catalog, storage).
 --   2. Complete schema assurance (tables, columns, indexes, constraints, RLS policies).
---   3. Strict View Compatibility (PostgreSQL 42P16 compliant; exact column names & order).
---   4. Accurate Ranking Score Formula: (likes * 3) + (listens * 1) + (recitations * 5).
---   5. Real-time pre-aggregation subqueries (prevents Cartesian multiplication).
---   6. Hardened Administrative RPC Security (is_admin() gatekeeper + revoked public access).
---   7. Public Visitor Access (guest submissions, likes, listen events).
---   8. Cascade Deletion Functions & Broadcast Notification Dispatching.
---   9. PostgREST Schema Cache Reload.
+--   3. Explicit DROP FUNCTION/VIEW guards to prevent PostgreSQL 42P13 return-type mismatch errors.
+--   4. Strict View Compatibility (PostgreSQL 42P16 compliant; exact column names & order).
+--   5. Accurate Ranking Score Formula: (likes * 3) + (listens * 1) + (recitations * 5).
+--   6. Real-time pre-aggregation subqueries (prevents Cartesian multiplication).
+--   7. Hardened Administrative RPC Security (is_admin() gatekeeper + revoked public access).
+--   8. Public Visitor Access (guest submissions, likes, listen events).
+--   9. Cascade Deletion Functions & Broadcast Notification Dispatching.
+--   10. PostgREST Schema Cache Reload.
 -- ============================================================================
 
 -- ============================================================================
@@ -194,6 +195,7 @@ CREATE INDEX IF NOT EXISTS idx_submissions_status ON public.recitation_submissio
 -- ============================================================================
 -- SECTION 3: ROLE VALIDATION FUNCTIONS (is_admin / is_super_admin)
 -- ============================================================================
+DROP FUNCTION IF EXISTS public.is_admin() CASCADE;
 CREATE OR REPLACE FUNCTION public.is_admin()
 RETURNS BOOLEAN AS $$
 BEGIN
@@ -206,6 +208,7 @@ BEGIN
 END;
 $$ LANGUAGE plpgsql SECURITY DEFINER SET search_path = public, pg_temp;
 
+DROP FUNCTION IF EXISTS public.is_super_admin() CASCADE;
 CREATE OR REPLACE FUNCTION public.is_super_admin()
 RETURNS BOOLEAN AS $$
 BEGIN
@@ -225,6 +228,10 @@ GRANT EXECUTE ON FUNCTION public.is_super_admin() TO anon, authenticated;
 -- ============================================================================
 -- SECTION 4: STRICT VIEW COMPATIBILITY & REAL-TIME PRE-AGGREGATED STATS
 -- ============================================================================
+
+-- Drop views first to avoid any column definition or return type conflicts
+DROP VIEW IF EXISTS public.reciter_statistics_view CASCADE;
+DROP VIEW IF EXISTS public.recitation_statistics_view CASCADE;
 
 -- 4.1. Reciter Statistics View
 -- Exact legacy column order from Migration 008 + extensions from Migration 024:
@@ -348,6 +355,9 @@ GRANT SELECT ON public.recitation_statistics_view TO anon, authenticated;
 -- ============================================================================
 
 -- 5.1. Public Recitation Submission RPC (Guest safe via SECURITY DEFINER)
+DROP FUNCTION IF EXISTS public.submit_recitation_public(TEXT, TEXT, BOOLEAN, TEXT, TEXT, TEXT, INTEGER, TEXT, INTEGER, INTEGER, TEXT, TEXT, TEXT, TEXT) CASCADE;
+DROP FUNCTION IF EXISTS public.submit_recitation_public CASCADE;
+
 CREATE OR REPLACE FUNCTION public.submit_recitation_public(
     p_display_name TEXT,
     p_pseudonym TEXT DEFAULT NULL,
@@ -425,17 +435,27 @@ BEGIN
 END;
 $$ LANGUAGE plpgsql SECURITY DEFINER SET search_path = public, pg_temp;
 
--- 5.2. Public Like Toggle RPC
+-- 5.2. Public Like Toggle RPC (Returns Table of is_liked & total_likes for PostgREST array response)
+DROP FUNCTION IF EXISTS public.toggle_recitation_like(UUID, TEXT) CASCADE;
+DROP FUNCTION IF EXISTS public.toggle_recitation_like CASCADE;
+
 CREATE OR REPLACE FUNCTION public.toggle_recitation_like(
     p_recitation_id UUID,
     p_anonymous_installation_id TEXT
 )
-RETURNS JSON AS $$
+RETURNS TABLE (
+    is_liked BOOLEAN,
+    total_likes BIGINT
+) AS $$
 DECLARE
     v_exists BOOLEAN;
     v_new_state BOOLEAN;
-    v_total_likes INT;
+    v_total_likes BIGINT;
 BEGIN
+    IF p_recitation_id IS NULL OR p_anonymous_installation_id IS NULL OR TRIM(p_anonymous_installation_id) = '' THEN
+        RAISE EXCEPTION 'Invalid parameters: recitation_id and anonymous_installation_id are required';
+    END IF;
+
     SELECT EXISTS (
         SELECT 1
         FROM public.likes
@@ -457,7 +477,8 @@ BEGIN
             p_recitation_id,
             p_anonymous_installation_id,
             NOW()
-        );
+        )
+        ON CONFLICT (recitation_id, anonymous_installation_id) DO NOTHING;
         v_new_state := TRUE;
     END IF;
 
@@ -465,14 +486,14 @@ BEGIN
     FROM public.likes
     WHERE recitation_id = p_recitation_id;
 
-    RETURN json_build_object(
-        'is_liked', v_new_state,
-        'total_likes', v_total_likes
-    );
+    RETURN QUERY SELECT v_new_state, v_total_likes;
 END;
 $$ LANGUAGE plpgsql SECURITY DEFINER SET search_path = public, pg_temp;
 
 -- 5.3. Public Listen Event Recording RPC
+DROP FUNCTION IF EXISTS public.record_listen_event(UUID, TEXT, INTEGER, BOOLEAN) CASCADE;
+DROP FUNCTION IF EXISTS public.record_listen_event CASCADE;
+
 CREATE OR REPLACE FUNCTION public.record_listen_event(
     p_recitation_id UUID,
     p_anonymous_installation_id TEXT,
@@ -507,6 +528,7 @@ GRANT EXECUTE ON FUNCTION public.record_listen_event(UUID, TEXT, INTEGER, BOOLEA
 -- ============================================================================
 
 -- 6.1. Admin Dashboard Aggregated Metrics
+DROP FUNCTION IF EXISTS public.get_admin_dashboard_metrics() CASCADE;
 CREATE OR REPLACE FUNCTION public.get_admin_dashboard_metrics()
 RETURNS JSON AS $$
 DECLARE
@@ -549,6 +571,7 @@ END;
 $$ LANGUAGE plpgsql SECURITY DEFINER SET search_path = public, pg_temp;
 
 -- 6.2. Cascade Deletion: Reciter
+DROP FUNCTION IF EXISTS public.admin_delete_reciter(UUID) CASCADE;
 CREATE OR REPLACE FUNCTION public.admin_delete_reciter(p_id UUID)
 RETURNS VOID AS $$
 BEGIN
@@ -572,6 +595,7 @@ END;
 $$ LANGUAGE plpgsql SECURITY DEFINER SET search_path = public, pg_temp;
 
 -- 6.3. Cascade Deletion: Recitation
+DROP FUNCTION IF EXISTS public.admin_delete_recitation(UUID) CASCADE;
 CREATE OR REPLACE FUNCTION public.admin_delete_recitation(p_id UUID)
 RETURNS VOID AS $$
 BEGIN
@@ -586,6 +610,7 @@ END;
 $$ LANGUAGE plpgsql SECURITY DEFINER SET search_path = public, pg_temp;
 
 -- 6.4. Cascade Deletion: Competition
+DROP FUNCTION IF EXISTS public.admin_delete_competition(UUID) CASCADE;
 CREATE OR REPLACE FUNCTION public.admin_delete_competition(p_id UUID)
 RETURNS VOID AS $$
 BEGIN
@@ -598,6 +623,7 @@ END;
 $$ LANGUAGE plpgsql SECURITY DEFINER SET search_path = public, pg_temp;
 
 -- 6.5. Cascade Deletion: Announcement
+DROP FUNCTION IF EXISTS public.admin_delete_announcement(UUID) CASCADE;
 CREATE OR REPLACE FUNCTION public.admin_delete_announcement(p_id UUID)
 RETURNS VOID AS $$
 BEGIN
@@ -610,6 +636,7 @@ END;
 $$ LANGUAGE plpgsql SECURITY DEFINER SET search_path = public, pg_temp;
 
 -- 6.6. Cascade Deletion: Submission
+DROP FUNCTION IF EXISTS public.admin_delete_submission(UUID) CASCADE;
 CREATE OR REPLACE FUNCTION public.admin_delete_submission(p_id UUID)
 RETURNS VOID AS $$
 BEGIN
@@ -622,6 +649,7 @@ END;
 $$ LANGUAGE plpgsql SECURITY DEFINER SET search_path = public, pg_temp;
 
 -- 6.7. Cascade Deletion: User Profile & Devices
+DROP FUNCTION IF EXISTS public.admin_delete_user(UUID) CASCADE;
 CREATE OR REPLACE FUNCTION public.admin_delete_user(p_id UUID)
 RETURNS VOID AS $$
 DECLARE
@@ -644,6 +672,7 @@ END;
 $$ LANGUAGE plpgsql SECURITY DEFINER SET search_path = public, pg_temp;
 
 -- 6.8. Delete Admin Notification
+DROP FUNCTION IF EXISTS public.admin_delete_notification(UUID) CASCADE;
 CREATE OR REPLACE FUNCTION public.admin_delete_notification(p_id UUID)
 RETURNS VOID AS $$
 BEGIN
@@ -656,6 +685,9 @@ END;
 $$ LANGUAGE plpgsql SECURITY DEFINER SET search_path = public, pg_temp;
 
 -- 6.9. Admin Broadcast Notification Dispatcher
+DROP FUNCTION IF EXISTS public.admin_send_broadcast(TEXT, TEXT, TEXT, TEXT, TEXT) CASCADE;
+DROP FUNCTION IF EXISTS public.admin_send_broadcast CASCADE;
+
 CREATE OR REPLACE FUNCTION public.admin_send_broadcast(
     p_title TEXT,
     p_body TEXT,
