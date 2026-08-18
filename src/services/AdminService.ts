@@ -568,31 +568,40 @@ class AdminServiceImpl {
   // ============================================================================
 
   async getSubmissions(status?: SubmissionStatus): Promise<RecitationSubmission[]> {
-    let url = `${SUPABASE_CONFIG.restBaseUrl}/recitation_submissions?select=*&order=created_at.desc`;
-    if (status) {
-      url += `&status=in.(${encodeURIComponent(status.toUpperCase())},${encodeURIComponent(status.toLowerCase())})`;
-    }
-
-    const res = await fetch(url, { headers: this.getAuthHeaders() });
-    if (!res.ok) {
-      // Fallback query without status filter if filtered query returned error
-      const fbRes = await fetch(`${SUPABASE_CONFIG.restBaseUrl}/recitation_submissions?select=*&order=created_at.desc`, {
-        headers: this.getAuthHeaders()
-      });
-      if (fbRes.ok) {
-        const fbRows = await fbRes.json();
-        if (Array.isArray(fbRows)) {
-          const filtered = status
-            ? fbRows.filter((r: any) => r.status?.toLowerCase() === status.toLowerCase())
-            : fbRows;
-          return filtered.map((r: any) => this.mapSubmissionRow(r));
-        }
+    try {
+      let url = `${SUPABASE_CONFIG.restBaseUrl}/recitation_submissions?select=*&order=created_at.desc`;
+      if (status) {
+        url += `&status=in.(${encodeURIComponent(status.toUpperCase())},${encodeURIComponent(status.toLowerCase())})`;
       }
-      throw new Error(`HTTP ${res.status}`);
-    }
-    const rows = await res.json();
 
-    return rows.map((r: any) => this.mapSubmissionRow(r));
+      const res = await fetch(url, { headers: this.getAuthHeaders() });
+      if (!res.ok) {
+        if (res.status === 401 && this.authState.token) {
+          console.warn('Admin token expired on getSubmissions (401), clearing stale session');
+          this.clearSession();
+        }
+        // Fallback query without status filter if filtered query returned error
+        const fbRes = await fetch(`${SUPABASE_CONFIG.restBaseUrl}/recitation_submissions?select=*&order=created_at.desc`, {
+          headers: this.getAuthHeaders()
+        });
+        if (fbRes.ok) {
+          const fbRows = await fbRes.json();
+          if (Array.isArray(fbRows)) {
+            const filtered = status
+              ? fbRows.filter((r: any) => r.status?.toLowerCase() === status.toLowerCase())
+              : fbRows;
+            return filtered.map((r: any) => this.mapSubmissionRow(r));
+          }
+        }
+        return [];
+      }
+      const rows = await res.json();
+      if (!Array.isArray(rows)) return [];
+      return rows.map((r: any) => this.mapSubmissionRow(r));
+    } catch (e) {
+      console.warn('getSubmissions query warning:', e);
+      return [];
+    }
   }
 
   private mapSubmissionRow(r: any): RecitationSubmission {
@@ -616,14 +625,18 @@ class AdminServiceImpl {
       externalImageUrl: r.profile_image_path,
       agreeToTerms: true,
       submittedAt: r.created_at,
-      status: (r.status?.toLowerCase() || 'pending') as SubmissionStatus,
+      status: (
+        r.status?.toUpperCase() === 'APPROVED' ? 'approved' :
+        r.status?.toUpperCase() === 'APPROVED_UNPUBLISHED' ? 'approved_unpublished' :
+        r.status?.toUpperCase() === 'REJECTED' ? 'rejected' : 'pending'
+      ) as SubmissionStatus,
       adminNotes: r.admin_notes
     };
   }
 
   async updateSubmissionStatus(
     submissionId: string,
-    status: 'APPROVED' | 'REJECTED' | 'PENDING',
+    status: 'APPROVED' | 'APPROVED_UNPUBLISHED' | 'REJECTED' | 'PENDING',
     adminNotes?: string
   ): Promise<void> {
     const res = await fetch(
@@ -662,6 +675,7 @@ class AdminServiceImpl {
     submission: RecitationSubmission;
     reciterId?: string;
     createNewReciter?: boolean;
+    publishDirectly?: boolean;
     newReciterData?: {
       displayName: string;
       pseudonym?: string;
@@ -690,6 +704,7 @@ class AdminServiceImpl {
     adminNotes?: string;
   }): Promise<{ reciterId?: string; recitationId?: string }> {
     let finalReciterId = params.reciterId;
+    const isPublished = params.publishDirectly !== false;
 
     // 1. Create new reciter if requested
     if (params.createNewReciter && params.newReciterData) {
@@ -713,7 +728,7 @@ class AdminServiceImpl {
           profile_image_path: params.newReciterData.profileImagePath || null,
           is_verified: params.newReciterData.isVerified,
           is_featured: params.newReciterData.isFeatured,
-          is_published: params.newReciterData.isPublished
+          is_published: isPublished ? params.newReciterData.isPublished : false
         })
       });
 
@@ -750,18 +765,23 @@ class AdminServiceImpl {
         external_audio_url: params.recitationData.externalAudioUrl || null,
         cover_image_path: params.recitationData.coverImagePath || null,
         description: params.recitationData.description || '',
-        status: 'APPROVED',
-        is_staff_pick: !!params.recitationData.isStaffPick,
-        published_at: new Date().toISOString()
+        status: isPublished ? 'APPROVED' : 'APPROVED_UNPUBLISHED',
+        is_published: isPublished,
+        is_staff_pick: isPublished ? !!params.recitationData.isStaffPick : false,
+        published_at: isPublished ? new Date().toISOString() : null
       })
     });
 
     if (!recitationRes.ok) {
-      throw new Error(`Failed to publish recitation (HTTP ${recitationRes.status})`);
+      throw new Error(`Failed to save recitation (HTTP ${recitationRes.status})`);
     }
 
-    // 3. Mark submission as approved
-    await this.updateSubmissionStatus(params.submission.id, 'APPROVED', params.adminNotes);
+    // 3. Mark submission as approved or approved_unpublished
+    await this.updateSubmissionStatus(
+      params.submission.id,
+      isPublished ? 'APPROVED' : 'APPROVED_UNPUBLISHED',
+      params.adminNotes
+    );
 
     return { reciterId: finalReciterId };
   }
@@ -1144,20 +1164,32 @@ class AdminServiceImpl {
   // ============================================================================
 
   async getAnnouncements(): Promise<Announcement[]> {
-    const res = await fetch(`${SUPABASE_CONFIG.restBaseUrl}/announcements?select=*&order=created_at.desc`, {
-      headers: this.getAuthHeaders()
-    });
-    if (!res.ok) throw new Error(`HTTP ${res.status}`);
-    const rows = await res.json();
-    return rows.map((r: any) => ({
-      id: r.id,
-      title: r.title,
-      body: r.body,
-      imagePath: r.image_path,
-      isPublished: r.is_published,
-      publishedAt: r.published_at,
-      createdAt: r.created_at
-    }));
+    try {
+      const res = await fetch(`${SUPABASE_CONFIG.restBaseUrl}/announcements?select=*&order=created_at.desc`, {
+        headers: this.getAuthHeaders()
+      });
+      if (!res.ok) {
+        if (res.status === 401 && this.authState.token) {
+          console.warn('Admin token expired on getAnnouncements (401), clearing stale session');
+          this.clearSession();
+        }
+        return [];
+      }
+      const rows = await res.json();
+      if (!Array.isArray(rows)) return [];
+      return rows.map((r: any) => ({
+        id: r.id,
+        title: r.title,
+        body: r.body,
+        imagePath: r.image_path,
+        isPublished: r.is_published,
+        publishedAt: r.published_at,
+        createdAt: r.created_at
+      }));
+    } catch (e) {
+      console.warn('getAnnouncements warning:', e);
+      return [];
+    }
   }
 
   async createAnnouncement(data: {
@@ -1283,22 +1315,34 @@ class AdminServiceImpl {
   // ============================================================================
 
   async getCompetitions(): Promise<Competition[]> {
-    const res = await fetch(`${SUPABASE_CONFIG.restBaseUrl}/competitions?select=*&order=created_at.desc`, {
-      headers: this.getAuthHeaders()
-    });
-    if (!res.ok) throw new Error(`HTTP ${res.status}`);
-    const rows = await res.json();
-    return rows.map((r: any) => ({
-      id: r.id,
-      title: r.title,
-      description: r.description,
-      imagePath: r.image_path,
-      linkUrl: r.link_url,
-      startAt: r.start_at,
-      endAt: r.end_at,
-      isPublished: r.is_published,
-      createdAt: r.created_at
-    }));
+    try {
+      const res = await fetch(`${SUPABASE_CONFIG.restBaseUrl}/competitions?select=*&order=created_at.desc`, {
+        headers: this.getAuthHeaders()
+      });
+      if (!res.ok) {
+        if (res.status === 401 && this.authState.token) {
+          console.warn('Admin token expired on getCompetitions (401), clearing stale session');
+          this.clearSession();
+        }
+        return [];
+      }
+      const rows = await res.json();
+      if (!Array.isArray(rows)) return [];
+      return rows.map((r: any) => ({
+        id: r.id,
+        title: r.title,
+        description: r.description,
+        imagePath: r.image_path,
+        linkUrl: r.link_url,
+        startAt: r.start_at,
+        endAt: r.end_at,
+        isPublished: r.is_published,
+        createdAt: r.created_at
+      }));
+    } catch (e) {
+      console.warn('getCompetitions warning:', e);
+      return [];
+    }
   }
 
   async createCompetition(data: {
@@ -1437,21 +1481,33 @@ class AdminServiceImpl {
   // ============================================================================
 
   async getRewardDefinitions(): Promise<RewardDefinition[]> {
-    const res = await fetch(`${SUPABASE_CONFIG.restBaseUrl}/reward_definitions?select=*&order=created_at.desc`, {
-      headers: this.getAuthHeaders()
-    });
-    if (!res.ok) throw new Error(`HTTP ${res.status}`);
-    const rows = await res.json();
-    return rows.map((r: any) => ({
-      id: r.id,
-      code: r.code,
-      title: r.title,
-      description: r.description,
-      category: r.category,
-      badgeIconPath: r.badge_icon_path,
-      isActive: r.is_active,
-      createdAt: r.created_at
-    }));
+    try {
+      const res = await fetch(`${SUPABASE_CONFIG.restBaseUrl}/reward_definitions?select=*&order=created_at.desc`, {
+        headers: this.getAuthHeaders()
+      });
+      if (!res.ok) {
+        if (res.status === 401 && this.authState.token) {
+          console.warn('Admin token expired on getRewardDefinitions (401), clearing stale session');
+          this.clearSession();
+        }
+        return [];
+      }
+      const rows = await res.json();
+      if (!Array.isArray(rows)) return [];
+      return rows.map((r: any) => ({
+        id: r.id,
+        code: r.code,
+        title: r.title,
+        description: r.description,
+        category: r.category,
+        badgeIconPath: r.badge_icon_path,
+        isActive: r.is_active,
+        createdAt: r.created_at
+      }));
+    } catch (e) {
+      console.warn('getRewardDefinitions warning:', e);
+      return [];
+    }
   }
 
   async createRewardDefinition(data: {
@@ -1712,21 +1768,33 @@ class AdminServiceImpl {
   // ============================================================================
 
   async getAdminNotifications(): Promise<AdminNotification[]> {
-    const res = await fetch(`${SUPABASE_CONFIG.restBaseUrl}/admin_notifications?select=*&order=created_at.desc`, {
-      headers: this.getAuthHeaders()
-    });
-    if (!res.ok) throw new Error(`HTTP ${res.status}`);
-    const rows = await res.json();
-    return rows.map((r: any) => ({
-      id: r.id,
-      notificationType: r.notification_type,
-      title: r.title,
-      content: r.content,
-      referenceId: r.reference_id,
-      isRead: r.is_read,
-      sentViaEmail: r.sent_via_email,
-      createdAt: r.created_at
-    }));
+    try {
+      const res = await fetch(`${SUPABASE_CONFIG.restBaseUrl}/admin_notifications?select=*&order=created_at.desc`, {
+        headers: this.getAuthHeaders()
+      });
+      if (!res.ok) {
+        if (res.status === 401 && this.authState.token) {
+          console.warn('Admin token expired on getAdminNotifications (401), clearing stale session');
+          this.clearSession();
+        }
+        return [];
+      }
+      const rows = await res.json();
+      if (!Array.isArray(rows)) return [];
+      return rows.map((r: any) => ({
+        id: r.id,
+        notificationType: r.notification_type,
+        title: r.title,
+        content: r.content,
+        referenceId: r.reference_id,
+        isRead: r.is_read,
+        sentViaEmail: r.sent_via_email,
+        createdAt: r.created_at
+      }));
+    } catch (e) {
+      console.warn('getAdminNotifications warning:', e);
+      return [];
+    }
   }
 
   async markNotificationAsRead(id: string): Promise<void> {

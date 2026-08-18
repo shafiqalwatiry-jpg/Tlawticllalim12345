@@ -55,7 +55,7 @@ export interface Recitation {
   createdAt: string;
 }
 
-export type SubmissionStatus = 'pending' | 'approved' | 'rejected';
+export type SubmissionStatus = 'pending' | 'approved' | 'approved_unpublished' | 'rejected';
 
 export interface RecitationSubmission {
   id: string;
@@ -121,7 +121,26 @@ export interface AdminProfile {
 export interface AdminAuthState {
   isAuthenticated: boolean;
   token: string | null;
+  refreshToken?: string | null;
+  expiresAt?: number | null;
   admin: AdminProfile | null;
+}
+
+export interface SystemCheckItem {
+  id: string;
+  name: string;
+  category: 'DATABASE' | 'AUTH' | 'TABLES' | 'STORAGE';
+  status: 'PASS' | 'WARN' | 'FAIL';
+  latencyMs: number;
+  details: string;
+  count?: number;
+}
+
+export interface SystemDiagnosticReport {
+  timestamp: string;
+  overallStatus: 'PASS' | 'WARN' | 'FAIL';
+  checks: SystemCheckItem[];
+  summary: string;
 }
 
 export interface AdminDashboardStats {

@@ -2,13 +2,14 @@ import {
   Reciter,
   Recitation,
   RecitationSubmission,
+  SubmissionStatus,
   ListenEvent,
   LikeResult,
   Competition,
   Announcement,
   ReciterHonor
 } from '../types';
-import { SupabaseService } from './SupabaseService';
+import { SupabaseService, SUPABASE_CONFIG } from './SupabaseService';
 import { userService } from './UserService';
 
 export enum DataSourceMode {
@@ -376,6 +377,64 @@ class HybridSubmissionRepository implements ISubmissionRepository {
   private listeners: Set<(subs: RecitationSubmission[]) => void> = new Set();
 
   async getUserSubmissions(): Promise<RecitationSubmission[]> {
+    if (currentDataSourceMode === DataSourceMode.SUPABASE) {
+      const installId = typeof window !== 'undefined' ? userService.getInstallationId() : undefined;
+      if (installId) {
+        try {
+          const res = await fetch(
+            `${SUPABASE_CONFIG.restBaseUrl}/recitation_submissions?installation_id=eq.${encodeURIComponent(installId)}&order=created_at.desc`,
+            {
+              headers: {
+                apikey: SUPABASE_CONFIG.anonKey,
+                Authorization: `Bearer ${SUPABASE_CONFIG.anonKey}`
+              }
+            }
+          );
+          if (res.ok) {
+            const rows = await res.json();
+            if (Array.isArray(rows)) {
+              const remoteMapped: RecitationSubmission[] = rows.map((r: any) => ({
+                id: r.id,
+                displayName: r.display_name,
+                pseudonym: r.pseudonym || undefined,
+                usePseudonym: !!r.use_pseudonym,
+                gender: r.gender?.toLowerCase() === 'female' ? 'female' : 'male',
+                country: r.country || 'العالم الإسلامي',
+                avatarUrl: r.profile_image_path ? SupabaseService.resolveImageUrl(r.profile_image_path, 'profile-images') : undefined,
+                surahNumber: r.surah_number,
+                surahName: r.surah_name,
+                ayahRange: r.ayah_start === r.ayah_end ? `${r.ayah_start}` : `${r.ayah_start} - ${r.ayah_end}`,
+                riwayah: r.riwayah,
+                description: r.description || '',
+                audioFileName: r.audio_storage_path?.split('/').pop() || 'audio.mp3',
+                audioDuration: 0,
+                audioStoragePath: r.audio_storage_path,
+                audioUrl: SupabaseService.resolveAudioUrl(r),
+                externalAudioUrl: r.external_audio_url,
+                externalImageUrl: r.profile_image_path,
+                agreeToTerms: true,
+                submittedAt: r.created_at,
+                status: (
+                  r.status === 'APPROVED' ? 'approved' :
+                  r.status === 'APPROVED_UNPUBLISHED' ? 'approved_unpublished' :
+                  r.status === 'REJECTED' ? 'rejected' : 'pending'
+                ) as SubmissionStatus,
+                adminNotes: r.admin_notes
+              }));
+
+              // Merge non-duplicate local items
+              const nonDuplicateLocal = this.submissions.filter(
+                (loc) => !remoteMapped.some((rem) => rem.id === loc.id)
+              );
+              this.submissions = [...remoteMapped, ...nonDuplicateLocal];
+              return this.submissions;
+            }
+          }
+        } catch (e) {
+          console.warn('Error fetching user submissions from Supabase:', e);
+        }
+      }
+    }
     return [...this.submissions];
   }
 

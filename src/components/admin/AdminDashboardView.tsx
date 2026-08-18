@@ -52,16 +52,23 @@ export function AdminDashboardView({ onNavigate, onNavigateTab }: AdminDashboard
   const loadStats = async () => {
     setIsLoading(true);
     try {
-      const [data, usersList, notifs] = await Promise.all([
+      const [dataResult, usersResult, notifsResult] = await Promise.allSettled([
         adminService.getDashboardStats(),
         adminService.getUsers(),
         adminService.getAdminNotifications()
       ]);
-      setStats(data);
-      setUserCount(usersList.length);
-      setUnreadNotifCount(notifs.filter((n) => !n.isRead).length);
+
+      if (dataResult.status === 'fulfilled') {
+        setStats(dataResult.value);
+      }
+      if (usersResult.status === 'fulfilled') {
+        setUserCount(usersResult.value.length);
+      }
+      if (notifsResult.status === 'fulfilled') {
+        setUnreadNotifCount(notifsResult.value.filter((n) => !n.isRead).length);
+      }
     } catch (e) {
-      console.error('Error loading stats:', e);
+      console.warn('Admin dashboard loadStats warning:', e);
     } finally {
       setIsLoading(false);
     }

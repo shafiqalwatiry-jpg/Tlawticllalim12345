@@ -117,7 +117,7 @@ export function AdminRecitationsView() {
     setAyahEnd(7);
     setRiwayah('حفص عن عاصم');
     setDurationSeconds(180);
-    setAudioStoragePath('recitation-audio/sample.mp3');
+    setAudioStoragePath('');
     setExternalAudioUrl('');
     setCoverImagePath('');
     setDescription('');
@@ -174,7 +174,7 @@ export function AdminRecitationsView() {
           ayahEnd: Number(ayahEnd),
           riwayah,
           durationSeconds: Number(durationSeconds),
-          audioStoragePath,
+          audioStoragePath: audioStoragePath.trim(),
           externalAudioUrl: externalAudioUrl.trim() ? externalAudioUrl : null,
           coverImagePath: coverImagePath.trim() ? coverImagePath : null,
           description: description.trim(),
@@ -190,7 +190,7 @@ export function AdminRecitationsView() {
           ayahEnd: Number(ayahEnd),
           riwayah,
           durationSeconds: Number(durationSeconds),
-          audioStoragePath: audioStoragePath || 'recitation-audio/default.mp3',
+          audioStoragePath: audioStoragePath.trim(),
           externalAudioUrl: externalAudioUrl.trim() ? externalAudioUrl : undefined,
           coverImagePath: coverImagePath.trim() ? coverImagePath : undefined,
           description: description.trim() ? description : undefined,

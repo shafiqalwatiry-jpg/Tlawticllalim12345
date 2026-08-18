@@ -199,6 +199,7 @@ export function AdminSubmissionsView() {
         submission: selectedSubmission,
         reciterId: isNew ? undefined : selectedReciterId,
         createNewReciter: isNew,
+        publishDirectly,
         newReciterData: isNew
           ? {
               displayName: selectedSubmission.displayName,
